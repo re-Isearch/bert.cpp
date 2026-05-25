@@ -1,6 +1,6 @@
 # bert.cpp
 
-This is a *heavily refactored* version of [ggml](https://github.com/ggerganov/ggml) to support the newest ggml tensor library (0.12 May 2026). It has been designed for re-Isearch's Schmate project [schmate](https://nlnet.nl/project/Re-Isearch-Vector/).  It may be a drop-in replacement for the last bert.cpp.
+This is a *heavily refactored* version of [bert.cpp](https://github.com/ggerganov/bert.cpp) to support the newest ggml tensor library (0.12 May 2026). It has been designed for re-Isearch's Schmate project [schmate](https://nlnet.nl/project/Re-Isearch-Vector/).  It may be a drop-in replacement for the last bert.cpp.
 
 Since many newer BERTish GGUF models use Sentencepiece rather than Wordpiece tokenization we try to detect things and choose the right tokenizer.
 
