@@ -107,3 +107,11 @@ target_link_libraries(bert PRIVATE ggml ${BERT_EXTRA_LIBS})
 # for shared libraries
 set_target_properties(ggml PROPERTIES POSITION_INDEPENDENT_CODE ON)
 set_target_properties(bert PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+set_target_properties(bert PROPERTIES
+    VERSION 2.12
+    SOVERSION 2
+)
+
+
+
