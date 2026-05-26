@@ -86,7 +86,7 @@ if (GGML_METAL)
 
     # copy ggml-metal.metal to bin directory
 
-    configure_file(ggml/src/ggml-metal.metal ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/ggml-metal.metal COPYONLY)
+    configure_file(ggml/src/ggml-metal/ggml-metal.metal ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/ggml-metal.metal COPYONLY)
 
 endif()
 
