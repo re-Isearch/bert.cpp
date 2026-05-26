@@ -91,6 +91,11 @@ struct bert_ctx {
 
     std::string  model_name = "";
     std::string  model_arch = "bert";
+
+    // Opaque graph cache (bert_graph_cache_map *). Built lazily on first forward
+    // at a given (max_len, batch_size); reused for all subsequent forwards at the
+    // same shape so we avoid rebuilding the graph and re-running gallocr.
+    void * graph_cache = nullptr;
 };
 
 
