@@ -38,7 +38,7 @@ main:     eval time =    21.52 ms / 5.38 ms per token
 
 Above were all single shot.
 
-Turning now to a 335-million parameter model and more exhaustive produuction-like benchmarks:
+Turning now to a 335-million parameter model and more exhaustive production-like benchmarks:
 <PRE>
 Model: bge-large-en-v1.5  arch=bert  n_embd=1024  load=150 ms
 Warmup=5 iters, measure=50 iters
