@@ -59,9 +59,9 @@ Warmup=5 iters, measure=50 iters
 
 Because throughput peaks at around 3,484 tokens/sec (0.29 ms per token) we use these metrics to calculate some real-world document ingestion limits.  If you block your raw text files into standard overlapping paragraph windows of roughly 256 tokens each: A single passage will compute in ~78 ms.
 
-Our test M1-Pro chews through roughly 45 passages per second per instance (3484 tok/s÷78 ms). That means one can expect to process 2,700 fully dense semantic records per minute on a baseline Apple Silicon chip.  Our tests on M3Pro and M4Pro should even significntly high throughputs (80k tokens/s or as much as 20x).
+Our test M1-Pro chews through roughly 45 passages per second per instance (3484 tok/s÷78 ms). That means one can expect to process 2,700 fully dense semantic records per minute on a baseline Apple Silicon chip.  Our tests on M3Pro and M4Pro showed even significantly higher throughputs (80k tokens/s or as much as 20x).
 
-We are developing and benchmarking using the M1 as a baseline upon which to base preformance expectations. Instead of demanding the latest and greatest (or an array of H200s) we want to provide usefull performance on litteraly "*the smallest machine possible*".
+We are developing and benchmarking using the M1 as a baseline upon which to base preformance expectations. Instead of demanding the latest and greatest (or an array of H200s) our design goals and constaints are to provide useful performance on literaly "*the smallest machine possible*"-- and not to demand some hyperscalar cluster.
 
 - M1 Pro (ARMv8): Uses an older iteration of Apple's proprietary AMX (Apple Matrix Coprocessor). It is highly optimized for accelerating single-sequence matrix-vector math (bs=1).
 - M4 Family (ARMv9 + SME): The M4 introduced SME (Scalable Matrix Extension). SME is explicitly designed to handle outer-product matrix-matrix tiles natively in hardware. When you increase the batch size, the mathematical operation changes from a series of matrix-vector multiplies into a massive matrix-matrix multiplication (GEMM). The M4's SME hardware can swallow those batched matrix tiles concurrently, executing them multiple times faster per clock cycle than the M1 Pro's AMX.
