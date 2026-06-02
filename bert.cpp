@@ -66,6 +66,7 @@ For these use the llama.cpp interface.
 #include <algorithm>
 #include <memory>
 #include <stdexcept>
+#include <unordered_set>
 #include <utility>
 
 #define BERT_MAX_NODES 4096
@@ -76,6 +77,131 @@ static const int verbosity = 0;
 extern "C" {
     void ggml_log_internal(enum ggml_log_level level, const char * format, ...);
 };
+
+
+// ---------------------------------------------------------------------------
+// Backend capability probing
+//
+// bert_backend_supports_get_rows()
+//   Probes whether `backend` can execute ggml_get_rows over a weight tensor
+//   of a given type (e.g. GGML_TYPE_Q4_K).  Uses a zero-allocation scratch
+//   context so no real memory is consumed.
+//
+// bert_choose_backends()
+//   Selects the primary compute backend and, when the primary backend cannot
+//   handle get_rows (e.g. CUDA on Orin64 with Q4_K), also returns a CPU
+//   fallback backend that will be used exclusively for those ops.  All other
+//   ops still run on the primary backend.
+//
+//   Returning a non-null cpu_fallback signals to the rest of the code that a
+//   ggml_backend_sched should be created with both backends, and that the
+//   embedding weight tensors must be pinned to the CPU backend via
+//   ggml_backend_sched_set_tensor_backend().
+//
+//   The design is intentionally generic: any future op gap on any platform
+//   only requires updating bert_backend_supports_get_rows (or an analogous
+//   probe) — the scheduling machinery is already in place.
+// ---------------------------------------------------------------------------
+
+// Extensibility
+// To handle a future gap in a different op (e.g. a Vulkan backend missing
+// ggml_flash_attn_ext for some quant), add a second probe call in bert_choose_backends
+// and extend cpu_tensor_names accordingly. 
+
+static bool bert_backend_supports_get_rows(struct ggml_backend * backend,
+                                           enum ggml_type        weight_type) {
+    if (!backend) return false;
+
+    struct ggml_init_params params = {
+        .mem_size   = ggml_tensor_overhead() * 3,
+        .mem_buffer = nullptr,
+        .no_alloc   = true,
+    };
+    struct ggml_context * check_ctx = ggml_init(params);
+    if (!check_ctx) return false;
+
+    // Construct a minimal get_rows node that mirrors the real embedding lookup.
+    struct ggml_tensor * dummy_src  = ggml_new_tensor_2d(check_ctx, weight_type, 1, 1);
+    struct ggml_tensor * dummy_idx  = ggml_new_tensor_1d(check_ctx, GGML_TYPE_I32, 1);
+    struct ggml_tensor * dummy_node = ggml_get_rows(check_ctx, dummy_src, dummy_idx);
+
+    bool supported = ggml_backend_supports_op(backend, dummy_node);
+    ggml_free(check_ctx);
+    return supported;
+}
+
+// Result of backend selection.
+struct bert_backend_choice {
+    struct ggml_backend * primary     = nullptr; // always non-null on success
+    struct ggml_backend * cpu_fallback = nullptr; // non-null only when get_rows needs CPU
+};
+
+// Probe `candidate` for get_rows support against `weight_type`.
+// On success, fills `out` and returns true.
+// On gap detection, frees `candidate`, sets cpu_fallback, and returns true.
+// On init failure, returns false.
+static bool bert_try_gpu_backend(struct ggml_backend * candidate,
+                                 enum ggml_type        weight_type,
+                                 const char *          name,
+                                 bert_backend_choice & out) {
+    if (!candidate) return false;
+
+    if (bert_backend_supports_get_rows(candidate, weight_type)) {
+        ggml_log_internal(GGML_LOG_LEVEL_INFO,
+            "bert: using %s backend (full get_rows support)\n", name);
+        out.primary = candidate;
+    } else {
+        ggml_log_internal(GGML_LOG_LEVEL_WARN,
+            "bert: %s backend does not support get_rows for %s — "
+            "embedding lookups will run on CPU, all other ops on %s\n",
+            name, ggml_type_name(weight_type), name);
+        out.primary      = candidate;
+        out.cpu_fallback = ggml_backend_cpu_init();
+    }
+    return true;
+}
+
+// Choose the best available backend(s) for the given quantisation type.
+// `use_cpu` forces CPU-only (e.g. user override).
+static bert_backend_choice bert_choose_backends(bool use_cpu, enum ggml_type weight_type) {
+    bert_backend_choice result;
+
+    if (use_cpu) {
+        result.primary = ggml_backend_cpu_init();
+        ggml_log_internal(GGML_LOG_LEVEL_INFO, "bert: using CPU backend (forced)\n");
+        return result;
+    }
+
+#ifdef GGML_USE_CUDA
+    {
+        int best = get_best_gpu_index("CUDA");
+        struct ggml_backend * b = ggml_backend_cuda_init(best);
+        if (b && bert_try_gpu_backend(b, weight_type, "CUDA", result))
+            return result;
+    }
+#endif
+
+#ifdef GGML_USE_METAL
+    {
+        struct ggml_backend * b = ggml_backend_metal_init();
+        if (b && bert_try_gpu_backend(b, weight_type, "Metal", result))
+            return result;
+    }
+#endif
+
+#ifdef GGML_USE_VULKAN
+    {
+        int best = get_best_gpu_index("VULKAN");
+        struct ggml_backend * b = ggml_backend_vk_init(best);
+        if (b && bert_try_gpu_backend(b, weight_type, "Vulkan", result))
+            return result;
+    }
+#endif
+
+    result.primary = ggml_backend_cpu_init();
+    ggml_log_internal(GGML_LOG_LEVEL_INFO, "bert: using CPU backend (no GPU available)\n");
+    return result;
+}
 
 // ---------------------------------------------------------------------------
 // GGUF metadata helpers
@@ -511,9 +637,9 @@ bert_tokens bert_tokenize(bert_ctx * ctx, bert_string text, uint64_t n_max_token
 // ---------------------------------------------------------------------------
 // bert_load_from_file  (replaces the old version with ## WordPiece logic)
 // ---------------------------------------------------------------------------
-BERT_API struct bert_ctx * bert_load_from_file(const char * fname, bool use_cpu) {
-    // fprintf(stderr, "[BERT_LOAD] bert_load_from_file called: %s\n", fname);
 
+
+BERT_API struct bert_ctx * bert_load_from_file(const char * fname, bool use_cpu) {
     struct ggml_context  * ctx_ggml = nullptr;
     struct gguf_init_params gp = { /*.no_alloc=*/true, /*.ctx=*/&ctx_ggml };
     struct gguf_context  * ctx_gguf = gguf_init_from_file(fname, gp);
@@ -554,145 +680,229 @@ BERT_API struct bert_ctx * bert_load_from_file(const char * fname, bool use_cpu)
         hp.layer_norm_eps = get_f32(ctx_gguf, "bert.attention.layer_norm_epsilon");
     }
 
-    // -------------------------------------------------------------------------
     // Vocabulary — SentencePiece style
-    //
-    // ALL tokens go into token_to_id / _id_to_token keyed by their exact
-    // stored string (which includes the ▁ prefix where present).
-    // subword_token_to_id / _id_to_subword_token are left empty.
-    // -------------------------------------------------------------------------
     {
         const int v_id = gguf_find_key(ctx_gguf, KEY_TOKEN_LIST);
         if (v_id != -1) {
             const int n = gguf_get_arr_n(ctx_gguf, v_id);
             vocab.tokens.resize(n);
 
-	    // Detect vocab type by inspecting a mid-range token
-	    // While the standard Ur-BERT was WordPiece most modern are using SentencePiece
-	    const std::string probe = gguf_get_arr_str(ctx_gguf, v_id, 999);
-	    bctx->vocab.is_sentencepiece = (probe.size() >= 3 && (unsigned char)probe[0] == 0xe2 &&
+            const std::string probe = gguf_get_arr_str(ctx_gguf, v_id, 999);
+            bctx->vocab.is_sentencepiece = (probe.size() >= 3 && (unsigned char)probe[0] == 0xe2 &&
                 (unsigned char)probe[1] == 0x96 && (unsigned char)probe[2] == 0x81);
-	    ggml_log_internal(GGML_LOG_LEVEL_INFO, "%s: vocab type: %s (probe token 999='%s')\n",
+            ggml_log_internal(GGML_LOG_LEVEL_INFO, "%s: vocab type: %s (probe token 999='%s')\n",
                 __func__, bctx->vocab.is_sentencepiece ? "SentencePiece (▁)" : "WordPiece (##)", probe.c_str());
 
-	    // Load the vocabulary
             for (int i = 0; i < n; ++i) {
                 const std::string tok = gguf_get_arr_str(ctx_gguf, v_id, i);
-		if (bctx->vocab.is_sentencepiece) {
-                  vocab.tokens[i]        = tok;
-                  vocab.token_to_id[tok] = i;
-                  vocab._id_to_token[i]  = tok;
-		} else {
-		  // WordPiece split
-		  vocab.tokens[i]        = tok;
-		  if (tok.size() > 2 && tok.substr(0, 2) == "##") {
-		    vocab.subword_token_to_id[tok]      = i;
-		    vocab._id_to_subword_token[i]       = tok;
-		  } else {
-		    vocab.token_to_id[tok] = i;
-		    vocab._id_to_token[i]  = tok;
-		  }
-		} // end wordpiece
+                if (bctx->vocab.is_sentencepiece) {
+                    vocab.tokens[i]        = tok;
+                    vocab.token_to_id[tok] = i;
+                    vocab._id_to_token[i]  = tok;
+                } else {
+                    vocab.tokens[i]        = tok;
+                    if (tok.size() > 2 && tok.substr(0, 2) == "##") {
+                        vocab.subword_token_to_id[tok]      = i;
+                        vocab._id_to_subword_token[i]       = tok;
+                    } else {
+                        vocab.token_to_id[tok] = i;
+                        vocab._id_to_token[i]  = tok;
+                    }
+                }
             }
         }
     }
 
-    // Backend selection
-#ifdef GGML_USE_CUDA
-    if (!use_cpu) {
-        int best = get_best_gpu_index("CUDA");
-        bctx->backend = ggml_backend_cuda_init(best);
-        if (bctx->backend)
-            ggml_log_internal(GGML_LOG_LEVEL_INFO,
-                "%s: using CUDA device %d\n", __func__, best);
-    }
-#endif
-#ifdef GGML_USE_METAL
-    if (!use_cpu && !bctx->backend) {
-        bctx->backend = ggml_backend_metal_init();
-        if (bctx->backend)
-            ggml_log_internal(GGML_LOG_LEVEL_INFO,
-                "%s: using Metal backend\n", __func__);
-    }
-#endif
-#ifdef GGML_USE_VULKAN
-    if (!use_cpu && !bctx->backend) {
-        int best = get_best_gpu_index("VULKAN");
-        bctx->backend = ggml_backend_vk_init(best);
-        if (bctx->backend)
-            ggml_log_internal(GGML_LOG_LEVEL_INFO,
-                "%s: using Vulkan backend, device %d\n", __func__, best);
-    }
-#endif
-    if (!bctx->backend) {
-        bctx->backend = ggml_backend_cpu_init();
-        ggml_log_internal(GGML_LOG_LEVEL_INFO,
-            "%s: using CPU backend\n", __func__);
+    // Capture tensor count here so it's globally visible across all subsequent blocks
+    const int n_tensors = gguf_get_n_tensors(ctx_gguf);
+
+    // =========================================================================
+    // 1. CHOOSE BACKEND(S)
+    //
+    // Probe the primary backend for get_rows support against the actual
+    // embedding quantisation type.  If the primary backend can't handle it
+    // (e.g. CUDA on Orin64 with Q4_K), bert_choose_backends returns both a
+    // primary GPU backend AND a cpu_fallback backend.  Embedding weight tensors
+    // are then kept in host memory (cpu_weights_buffer) and the compute graph
+    // is scheduled across both backends so only the get_rows nodes run on CPU.
+    // =========================================================================
+
+    // Determine the quantisation type of the word-embedding weight so we can
+    // probe exactly the operation that would otherwise crash at inference time.
+    enum ggml_type embd_type = GGML_TYPE_F32;
+    {
+        static const char * embd_names[] = {
+            "token_embd.weight",
+            "bert.embeddings.word_embeddings.weight",
+            "embeddings.word_embeddings.weight",
+            nullptr
+        };
+        for (int k = 0; embd_names[k]; ++k) {
+            struct ggml_tensor * t = ggml_get_tensor(ctx_ggml, embd_names[k]);
+            if (t) { embd_type = t->type; break; }
+        }
     }
 
-    // ggml context for tensor metadata (shapes/names only, no data)
-    const int n_tensors = gguf_get_n_tensors(ctx_gguf);
+    bert_backend_choice bc = bert_choose_backends(use_cpu, embd_type);
+    bctx->backend              = bc.primary;
+    bctx->cpu_fallback_backend = bc.cpu_fallback;  // null when GPU handles get_rows fine
+
+    // =========================================================================
+    // 2. ALLOCATE WEIGHT TENSORS
+    //
+    // When a cpu_fallback is present the three embedding tables must live in
+    // host memory (they are the get_rows sources; the CPU backend reads them
+    // directly). All other tensors go to the primary backend as usual.
+    //
+    // The split is implemented by allocating two ggml_contexts and two
+    // backend buffers:
+    //   ctx_data         / weights_buffer     — primary backend (GPU)
+    //   ctx_cpu_embd     / cpu_weights_buffer — CPU backend (embeddings only)
+    //
+    // When there is no cpu_fallback everything lands in ctx_data / weights_buffer
+    // exactly as before; the extra pointers stay null.
+    // =========================================================================
+
+    // Build a set of tensor names that must stay on CPU (embedding tables).
+    // Only populated in the split-backend case.
+    std::unordered_set<std::string> cpu_tensor_names;
+    if (bctx->cpu_fallback_backend) {
+        static const char * cpu_names[] = {
+            // SentencePiece / llama-style names
+            "token_embd.weight",
+            // BERT-style names
+            "bert.embeddings.word_embeddings.weight",
+            "bert.embeddings.token_type_embeddings.weight",
+            "bert.embeddings.position_embeddings.weight",
+            // flat names
+            "embeddings.word_embeddings.weight",
+            "embeddings.token_type_embeddings.weight",
+            "embeddings.position_embeddings.weight",
+            "token_types.weight",
+            "position_embd.weight",
+            nullptr
+        };
+        for (int k = 0; cpu_names[k]; ++k)
+            cpu_tensor_names.insert(cpu_names[k]);
+    }
+
+    // Count how many tensors go to each backend.
+    int n_cpu_tensors = 0, n_gpu_tensors = 0;
+    for (int i = 0; i < n_tensors; ++i) {
+        const char * name = gguf_get_tensor_name(ctx_gguf, i);
+        if (cpu_tensor_names.count(name)) ++n_cpu_tensors;
+        else                              ++n_gpu_tensors;
+    }
+
+    // Primary-backend context (all tensors if no split, GPU tensors if split).
     {
+        const int n_alloc = bctx->cpu_fallback_backend ? n_gpu_tensors : n_tensors;
         struct ggml_init_params p = {
-            static_cast<size_t>(n_tensors + 1) * ggml_tensor_overhead(),
+            static_cast<size_t>(n_alloc + 1) * ggml_tensor_overhead(),
             nullptr, true
         };
         bctx->ctx_data = ggml_init(p);
     }
 
+    // Optional CPU-side context for embedding tables.
+    struct ggml_context * ctx_cpu_embd = nullptr;
+    if (bctx->cpu_fallback_backend && n_cpu_tensors > 0) {
+        struct ggml_init_params p = {
+            static_cast<size_t>(n_cpu_tensors + 1) * ggml_tensor_overhead(),
+            nullptr, true
+        };
+        ctx_cpu_embd = ggml_init(p);
+    }
+
     for (int i = 0; i < n_tensors; ++i) {
         const char * name = gguf_get_tensor_name(ctx_gguf, i);
         struct ggml_tensor * src = ggml_get_tensor(ctx_ggml, name);
-        struct ggml_tensor * dst = ggml_dup_tensor(bctx->ctx_data, src);
+        bool on_cpu = cpu_tensor_names.count(name) > 0;
+        struct ggml_context * target_ctx = (on_cpu && ctx_cpu_embd) ? ctx_cpu_embd : bctx->ctx_data;
+        struct ggml_tensor * dst = ggml_dup_tensor(target_ctx, src);
         ggml_set_name(dst, name);
     }
 
-    // Allocate one contiguous backend buffer for all weights
     bctx->weights_buffer = ggml_backend_alloc_ctx_tensors(bctx->ctx_data, bctx->backend);
     if (!bctx->weights_buffer) {
-        ggml_log_internal(GGML_LOG_LEVEL_ERROR,
-            "%s: failed to allocate weights buffer\n", __func__);
+        ggml_log_internal(GGML_LOG_LEVEL_ERROR, "%s: failed to allocate weights buffer\n", __func__);
+        if (ctx_cpu_embd) ggml_free(ctx_cpu_embd);
         bert_free(bctx);
         return nullptr;
     }
 
-    // Read weight data from file
+    if (ctx_cpu_embd) {
+        bctx->cpu_weights_buffer = ggml_backend_alloc_ctx_tensors(ctx_cpu_embd, bctx->cpu_fallback_backend);
+        if (!bctx->cpu_weights_buffer) {
+            ggml_log_internal(GGML_LOG_LEVEL_ERROR, "%s: failed to allocate CPU embedding buffer\n", __func__);
+            ggml_free(ctx_cpu_embd);
+            bert_free(bctx);
+            return nullptr;
+        }
+        // Merge the CPU tensors into ctx_data so get_tensor_exhaustive finds them.
+        // We walk ctx_cpu_embd and re-register each tensor pointer into ctx_data
+        // via a zero-copy alias: ggml_dup_tensor + point data ptr at the real buffer.
+        // Simpler: just store ctx_cpu_embd as a second lookup context on bctx.
+        bctx->ctx_cpu_embd = ctx_cpu_embd;
+    }
+
+    // Read weight data from file into whichever buffer owns each tensor.
     {
         std::ifstream fin(fname, std::ios::binary);
         if (!fin) {
-            ggml_log_internal(GGML_LOG_LEVEL_ERROR,
-                "%s: cannot open '%s'\n", __func__, fname);
+            ggml_log_internal(GGML_LOG_LEVEL_ERROR, "%s: cannot open '%s'\n", __func__, fname);
             bert_free(bctx);
             return nullptr;
         }
         for (int i = 0; i < n_tensors; ++i) {
-            const char * name = gguf_get_tensor_name(ctx_gguf, i);
-            struct ggml_tensor * cur = ggml_get_tensor(bctx->ctx_data, name);
+            const char * name  = gguf_get_tensor_name(ctx_gguf, i);
+            bool on_cpu = cpu_tensor_names.count(name) > 0;
+            struct ggml_context * lookup = (on_cpu && bctx->ctx_cpu_embd) ? bctx->ctx_cpu_embd : bctx->ctx_data;
+            struct ggml_tensor  * cur    = ggml_get_tensor(lookup, name);
+            struct ggml_backend_buffer * buf = on_cpu ? bctx->cpu_weights_buffer : bctx->weights_buffer;
+
             fin.seekg(static_cast<std::streamoff>(
                 gguf_get_data_offset(ctx_gguf) + gguf_get_tensor_offset(ctx_gguf, i)),
                 std::ios::beg);
-            if (ggml_backend_buffer_is_host(bctx->weights_buffer)) {
+            if (buf && ggml_backend_buffer_is_host(buf)) {
                 fin.read(reinterpret_cast<char *>(cur->data), ggml_nbytes(cur));
             } else {
-                std::vector<uint8_t> buf(ggml_nbytes(cur));
-                fin.read(reinterpret_cast<char *>(buf.data()), ggml_nbytes(cur));
-                ggml_backend_tensor_set(cur, buf.data(), 0, ggml_nbytes(cur));
+                std::vector<uint8_t> tmp(ggml_nbytes(cur));
+                fin.read(reinterpret_cast<char *>(tmp.data()), ggml_nbytes(cur));
+                ggml_backend_tensor_set(cur, tmp.data(), 0, ggml_nbytes(cur));
             }
         }
     }
 
+    // Map model weight pointers.
+    // When the split-backend is active, embedding tensors live in ctx_cpu_embd.
+    // get_tensor_exhaustive only searches one context, so we provide a small
+    // helper lambda that checks both.
+    auto get_tensor_either = [&](std::vector<std::string> names) -> struct ggml_tensor * {
+        for (const auto & n : names) {
+            struct ggml_tensor * t = ggml_get_tensor(bctx->ctx_data, n.c_str());
+            if (t) return t;
+            if (bctx->ctx_cpu_embd) {
+                t = ggml_get_tensor(bctx->ctx_cpu_embd, n.c_str());
+                if (t) return t;
+            }
+        }
+        // Fall back to exhaustive search (prints error and exits on failure)
+        return get_tensor_exhaustive(bctx->ctx_data, ctx_gguf, names);
+    };
+
     // Map model weight pointers
     bert_model & model = bctx->model;
     {
-        model.word_embeddings = get_tensor_exhaustive(bctx->ctx_data, ctx_gguf,
+        model.word_embeddings = get_tensor_either(
             {"token_embd.weight",
              "bert.embeddings.word_embeddings.weight",
              "embeddings.word_embeddings.weight"});
-        model.token_type_embeddings = get_tensor_exhaustive(bctx->ctx_data, ctx_gguf,
+        model.token_type_embeddings = get_tensor_either(
             {"token_types.weight",
              "bert.embeddings.token_type_embeddings.weight",
              "embeddings.token_type_embeddings.weight"});
-        model.position_embeddings = get_tensor_exhaustive(bctx->ctx_data, ctx_gguf,
+        model.position_embeddings = get_tensor_either(
             {"position_embd.weight",
              "bert.embeddings.position_embeddings.weight",
              "embeddings.position_embeddings.weight"});
@@ -762,7 +972,6 @@ BERT_API struct bert_ctx * bert_load_from_file(const char * fname, bool use_cpu)
 
 
 
-
 BERT_API struct bert_ctx * bert_load_from_file_wordpiece(const char * fname, bool use_cpu) {
     struct ggml_context  * ctx_ggml = nullptr;
     struct gguf_init_params gp = { /*.no_alloc=*/true, /*.ctx=*/&ctx_ggml };
@@ -772,8 +981,6 @@ BERT_API struct bert_ctx * bert_load_from_file_wordpiece(const char * fname, boo
             "%s: failed to open '%s'\n", __func__, fname);
         return nullptr;
     }
-
-    // fprintf(stderr, "[BERT_LOAD] bert_load_from_file_wordpiece called: %s\n", fname);
 
     bert_ctx   * bctx  = new bert_ctx{};
     bert_hparams & hp    = bctx->model.hparams;
@@ -805,48 +1012,24 @@ BERT_API struct bert_ctx * bert_load_from_file_wordpiece(const char * fname, boo
                                 "qwen2.block_count", "general.block_count"});
         hp.layer_norm_eps = get_f32(ctx_gguf, "bert.attention.layer_norm_epsilon");
 
-#if 1
-	// Detect vocab type by inspecting a mid-range token
-	const std::string probe = gguf_get_arr_str(ctx_gguf, v_id, 999);
-	bctx->vocab.is_sentencepiece = (probe.size() >= 3 && (unsigned char)probe[0] == 0xe2 &&
-		(unsigned char)probe[1] == 0x96 && (unsigned char)probe[2] == 0x81);
-	ggml_log_internal(GGML_LOG_LEVEL_INFO, "%s: vocab type: %s (probe token 999='%s')\n",
-		__func__, bctx->vocab.is_sentencepiece ? "SentencePiece (▁)" : "WordPiece (##)", probe.c_str());
-#endif
+        const std::string probe = gguf_get_arr_str(ctx_gguf, v_id, 999);
+        bctx->vocab.is_sentencepiece = (probe.size() >= 3 && (unsigned char)probe[0] == 0xe2 &&
+            (unsigned char)probe[1] == 0x96 && (unsigned char)probe[2] == 0x81);
+        ggml_log_internal(GGML_LOG_LEVEL_INFO, "%s: vocab type: %s (probe token 999='%s')\n",
+            __func__, bctx->vocab.is_sentencepiece ? "SentencePiece (▁)" : "WordPiece (##)", probe.c_str());
     }
 
-
-
-    // ---------------------------------------------------------------------------
-    // Vocabulary
-    //
-    // Some GGUF files store tokens in arbitrary order with a separate
-    // "tokenizer.ggml.token_ids" array mapping array-position → true vocab ID.
-    // We must use true_id (not array index i) as the map key, otherwise common
-    // words like "who" end up at wrong IDs and the tokenizer produces all [UNK].
-    // ---------------------------------------------------------------------------
+    // Vocabulary Loading
     {
         const int v_id = gguf_find_key(ctx_gguf, KEY_TOKEN_LIST);
         if (v_id != -1) {
             const int n = gguf_get_arr_n(ctx_gguf, v_id);
             vocab.tokens.resize(n);
-
             const int ids_key = gguf_find_key(ctx_gguf, "tokenizer.ggml.token_ids");
-#if 0
-            fprintf(stderr, "%s: tokenizer.ggml.token_ids: %s\n",
-		__func__, ids_key != -1 ? "PRESENT (using true IDs)" : "absent (using array index as ID)");
-
-            for (int i = 0; i < 5 && i < n; ++i)
-                fprintf(stderr, "%s: array[%d] = '%s'\n",
-                    __func__, i, gguf_get_arr_str(ctx_gguf, v_id, i));
-#endif
 
             for (int i = 0; i < n; ++i) {
                 const std::string tok = gguf_get_arr_str(ctx_gguf, v_id, i);
-
-                // Use the true vocab ID from the remapping array if present,
-                // otherwise the array index IS the vocab ID (standard BERT GGUF).
-		const int true_id = (ids_key != -1)
+                const int true_id = (ids_key != -1)
                     ? ((const int32_t *)gguf_get_arr_data(ctx_gguf, ids_key))[i]
                     : i;
 
@@ -857,125 +1040,163 @@ BERT_API struct bert_ctx * bert_load_from_file_wordpiece(const char * fname, boo
                     vocab._id_to_subword_token[true_id]  = tok;
                 } else {
                     vocab.token_to_id[tok]      = true_id;
-                    vocab._id_to_token[true_id] = tok;
+                    vocab._id_to_token[true_id] = true_id;
                 }
             }
-
             fprintf(stderr, "%s: vocab loaded: %d tokens (%d root, %d subword)\n",
-                __func__, n,
-                (int)vocab.token_to_id.size(),
-                (int)vocab.subword_token_to_id.size());
-
-#if 0
-            // Sanity check — these must exist in any BERT WordPiece vocab
-            for (const char * s : {"[PAD]", "[UNK]", "[CLS]", "[SEP]", "who", "##ho"}) {
-                auto it1 = vocab.token_to_id.find(s);
-                auto it2 = vocab.subword_token_to_id.find(s);
-                fprintf(stderr, "%s: sanity '%s' -> %s\n", __func__, s,
-                    it1 != vocab.token_to_id.end()         ? std::to_string(it1->second).c_str() :
-                    it2 != vocab.subword_token_to_id.end() ? std::to_string(it2->second).c_str() :
-                    "MISSING");
-            }
-#endif
+                __func__, n, (int)vocab.token_to_id.size(), (int)vocab.subword_token_to_id.size());
         }
     }
 
-    // Backend selection
-#ifdef GGML_USE_CUDA
-    if (!use_cpu) {
-        int best = get_best_gpu_index("CUDA");
-        bctx->backend = ggml_backend_cuda_init(best);
-        if (bctx->backend)
-            ggml_log_internal(GGML_LOG_LEVEL_INFO,
-                "%s: using CUDA device %d\n", __func__, best);
-    }
-#endif
-#ifdef GGML_USE_METAL
-    if (!use_cpu && !bctx->backend) {
-        bctx->backend = ggml_backend_metal_init();
-        if (bctx->backend)
-            ggml_log_internal(GGML_LOG_LEVEL_INFO,
-                "%s: using Metal backend\n", __func__);
-    }
-#endif
-#ifdef GGML_USE_VULKAN
-    if (!use_cpu && !bctx->backend) {
-        int best = get_best_gpu_index("VULKAN");
-        bctx->backend = ggml_backend_vk_init(best);
-        if (bctx->backend)
-            ggml_log_internal(GGML_LOG_LEVEL_INFO,
-                "%s: using Vulkan backend, device %d\n", __func__, best);
-    }
-#endif
-    if (!bctx->backend) {
-        bctx->backend = ggml_backend_cpu_init();
-        ggml_log_internal(GGML_LOG_LEVEL_INFO,
-            "%s: using CPU backend\n", __func__);
+    // Capture tensor count early here as well
+    const int n_tensors = gguf_get_n_tensors(ctx_gguf);
+
+    // =========================================================================
+    // 1. CHOOSE BACKEND(S)  — see bert_choose_backends() for full rationale.
+    // =========================================================================
+    enum ggml_type embd_type = GGML_TYPE_F32;
+    {
+        static const char * embd_names[] = {
+            "token_embd.weight",
+            "bert.embeddings.word_embeddings.weight",
+            "embeddings.word_embeddings.weight",
+            nullptr
+        };
+        for (int k = 0; embd_names[k]; ++k) {
+            struct ggml_tensor * t = ggml_get_tensor(ctx_ggml, embd_names[k]);
+            if (t) { embd_type = t->type; break; }
+        }
     }
 
-    // ggml context for tensor metadata (shapes/names only, no data)
-    const int n_tensors = gguf_get_n_tensors(ctx_gguf);
+    bert_backend_choice bc = bert_choose_backends(use_cpu, embd_type);
+    bctx->backend              = bc.primary;
+    bctx->cpu_fallback_backend = bc.cpu_fallback;
+
+    // =========================================================================
+    // 2. ALLOCATE WEIGHT TENSORS  — see bert_load_from_file for full rationale.
+    // =========================================================================
+    std::unordered_set<std::string> cpu_tensor_names;
+    if (bctx->cpu_fallback_backend) {
+        static const char * cpu_names[] = {
+            "token_embd.weight",
+            "bert.embeddings.word_embeddings.weight",
+            "bert.embeddings.token_type_embeddings.weight",
+            "bert.embeddings.position_embeddings.weight",
+            "embeddings.word_embeddings.weight",
+            "embeddings.token_type_embeddings.weight",
+            "embeddings.position_embeddings.weight",
+            "token_types.weight",
+            "position_embd.weight",
+            nullptr
+        };
+        for (int k = 0; cpu_names[k]; ++k)
+            cpu_tensor_names.insert(cpu_names[k]);
+    }
+
+    int n_cpu_tensors = 0, n_gpu_tensors = 0;
+    for (int i = 0; i < n_tensors; ++i) {
+        const char * name = gguf_get_tensor_name(ctx_gguf, i);
+        if (cpu_tensor_names.count(name)) ++n_cpu_tensors;
+        else                              ++n_gpu_tensors;
+    }
+
     {
+        const int n_alloc = bctx->cpu_fallback_backend ? n_gpu_tensors : n_tensors;
         struct ggml_init_params p = {
-            static_cast<size_t>(n_tensors + 1) * ggml_tensor_overhead(),
+            static_cast<size_t>(n_alloc + 1) * ggml_tensor_overhead(),
             nullptr, true
         };
         bctx->ctx_data = ggml_init(p);
     }
 
+    struct ggml_context * ctx_cpu_embd = nullptr;
+    if (bctx->cpu_fallback_backend && n_cpu_tensors > 0) {
+        struct ggml_init_params p = {
+            static_cast<size_t>(n_cpu_tensors + 1) * ggml_tensor_overhead(),
+            nullptr, true
+        };
+        ctx_cpu_embd = ggml_init(p);
+    }
+
     for (int i = 0; i < n_tensors; ++i) {
         const char * name = gguf_get_tensor_name(ctx_gguf, i);
         struct ggml_tensor * src = ggml_get_tensor(ctx_ggml, name);
-        struct ggml_tensor * dst = ggml_dup_tensor(bctx->ctx_data, src);
+        bool on_cpu = cpu_tensor_names.count(name) > 0;
+        struct ggml_context * target_ctx = (on_cpu && ctx_cpu_embd) ? ctx_cpu_embd : bctx->ctx_data;
+        struct ggml_tensor * dst = ggml_dup_tensor(target_ctx, src);
         ggml_set_name(dst, name);
     }
 
-    // Allocate one contiguous backend buffer for all weights
     bctx->weights_buffer = ggml_backend_alloc_ctx_tensors(bctx->ctx_data, bctx->backend);
     if (!bctx->weights_buffer) {
-        ggml_log_internal(GGML_LOG_LEVEL_ERROR,
-            "%s: failed to allocate weights buffer\n", __func__);
+        ggml_log_internal(GGML_LOG_LEVEL_ERROR, "%s: failed to allocate weights buffer\n", __func__);
+        if (ctx_cpu_embd) ggml_free(ctx_cpu_embd);
         bert_free(bctx);
         return nullptr;
     }
 
-    // Read weight data from file
+    if (ctx_cpu_embd) {
+        bctx->cpu_weights_buffer = ggml_backend_alloc_ctx_tensors(ctx_cpu_embd, bctx->cpu_fallback_backend);
+        if (!bctx->cpu_weights_buffer) {
+            ggml_log_internal(GGML_LOG_LEVEL_ERROR, "%s: failed to allocate CPU embedding buffer\n", __func__);
+            ggml_free(ctx_cpu_embd);
+            bert_free(bctx);
+            return nullptr;
+        }
+        bctx->ctx_cpu_embd = ctx_cpu_embd;
+    }
+
     {
         std::ifstream fin(fname, std::ios::binary);
         if (!fin) {
-            ggml_log_internal(GGML_LOG_LEVEL_ERROR,
-                "%s: cannot open '%s'\n", __func__, fname);
+            ggml_log_internal(GGML_LOG_LEVEL_ERROR, "%s: cannot open '%s'\n", __func__, fname);
             bert_free(bctx);
             return nullptr;
         }
         for (int i = 0; i < n_tensors; ++i) {
-            const char * name = gguf_get_tensor_name(ctx_gguf, i);
-            struct ggml_tensor * cur = ggml_get_tensor(bctx->ctx_data, name);
+            const char * name  = gguf_get_tensor_name(ctx_gguf, i);
+            bool on_cpu = cpu_tensor_names.count(name) > 0;
+            struct ggml_context * lookup = (on_cpu && bctx->ctx_cpu_embd) ? bctx->ctx_cpu_embd : bctx->ctx_data;
+            struct ggml_tensor  * cur    = ggml_get_tensor(lookup, name);
+            struct ggml_backend_buffer * buf = on_cpu ? bctx->cpu_weights_buffer : bctx->weights_buffer;
+
             fin.seekg(static_cast<std::streamoff>(
                 gguf_get_data_offset(ctx_gguf) + gguf_get_tensor_offset(ctx_gguf, i)),
                 std::ios::beg);
-            if (ggml_backend_buffer_is_host(bctx->weights_buffer)) {
+            if (buf && ggml_backend_buffer_is_host(buf)) {
                 fin.read(reinterpret_cast<char *>(cur->data), ggml_nbytes(cur));
             } else {
-                std::vector<uint8_t> buf(ggml_nbytes(cur));
-                fin.read(reinterpret_cast<char *>(buf.data()), ggml_nbytes(cur));
-                ggml_backend_tensor_set(cur, buf.data(), 0, ggml_nbytes(cur));
+                std::vector<uint8_t> tmp(ggml_nbytes(cur));
+                fin.read(reinterpret_cast<char *>(tmp.data()), ggml_nbytes(cur));
+                ggml_backend_tensor_set(cur, tmp.data(), 0, ggml_nbytes(cur));
             }
         }
     }
 
+    auto get_tensor_either = [&](std::vector<std::string> names) -> struct ggml_tensor * {
+        for (const auto & n : names) {
+            struct ggml_tensor * t = ggml_get_tensor(bctx->ctx_data, n.c_str());
+            if (t) return t;
+            if (bctx->ctx_cpu_embd) {
+                t = ggml_get_tensor(bctx->ctx_cpu_embd, n.c_str());
+                if (t) return t;
+            }
+        }
+        return get_tensor_exhaustive(bctx->ctx_data, ctx_gguf, names);
+    };
+
     // Map model weight pointers
     bert_model & model = bctx->model;
     {
-        model.word_embeddings = get_tensor_exhaustive(bctx->ctx_data, ctx_gguf,
+        model.word_embeddings = get_tensor_either(
             {"token_embd.weight",
              "bert.embeddings.word_embeddings.weight",
              "embeddings.word_embeddings.weight"});
-        model.token_type_embeddings = get_tensor_exhaustive(bctx->ctx_data, ctx_gguf,
+        model.token_type_embeddings = get_tensor_either(
             {"token_types.weight",
              "bert.embeddings.token_type_embeddings.weight",
              "embeddings.token_type_embeddings.weight"});
-        model.position_embeddings = get_tensor_exhaustive(bctx->ctx_data, ctx_gguf,
+        model.position_embeddings = get_tensor_either(
             {"position_embd.weight",
              "bert.embeddings.position_embeddings.weight",
              "embeddings.position_embeddings.weight"});
@@ -1042,6 +1263,8 @@ BERT_API struct bert_ctx * bert_load_from_file_wordpiece(const char * fname, boo
     ggml_free(ctx_ggml);
     return bctx;
 }
+
+
 
 // ---------------------------------------------------------------------------
 // Buffer management
@@ -1113,6 +1336,10 @@ void bert_free(bert_ctx * ctx) {
         ggml_backend_buffer_free(ctx->weights_buffer);
         ctx->weights_buffer = nullptr;
     }
+    if (ctx->cpu_weights_buffer) {
+        ggml_backend_buffer_free(ctx->cpu_weights_buffer);
+        ctx->cpu_weights_buffer = nullptr;
+    }
     if (ctx->ctx_data) {
         ggml_free(ctx->ctx_data);
         ctx->ctx_data = nullptr;
@@ -1120,6 +1347,10 @@ void bert_free(bert_ctx * ctx) {
     if (ctx->backend) {
         ggml_backend_free(ctx->backend);
         ctx->backend = nullptr;
+    }
+    if (ctx->cpu_fallback_backend) {
+        ggml_backend_free(ctx->cpu_fallback_backend);
+        ctx->cpu_fallback_backend = nullptr;
     }
     delete ctx;
 }
@@ -1141,7 +1372,8 @@ struct bert_cached_graph {
     std::vector<uint8_t> buf_meta;             // backing for ctx_compute
     ggml_context       * ctx_compute = nullptr;
     ggml_cgraph        * gf          = nullptr;
-    ggml_gallocr_t       alloc       = nullptr;
+    ggml_gallocr_t       alloc       = nullptr; // used when no cpu_fallback_backend
+    ggml_backend_sched_t sched       = nullptr; // used when cpu_fallback_backend is set
 
     // Cached input/output tensor pointers — set during build, used by every
     // subsequent forward to avoid name lookups.
@@ -1165,6 +1397,7 @@ struct bert_cached_graph {
     std::vector<int32_t> scratch_types;
 
     ~bert_cached_graph() {
+        if (sched)       ggml_backend_sched_free(sched);
         if (alloc)       ggml_gallocr_free(alloc);
         if (ctx_compute) ggml_free(ctx_compute);
     }
@@ -1325,14 +1558,63 @@ build_cached_graph(bert_ctx * ctx, int max_len, int n_batch) {
     ggml_set_output(cg->output);
     ggml_build_forward_expand(cg->gf, cg->output);
 
-    // Allocate compute buffers for this fixed graph shape.
-    ggml_backend_dev_t          dev  = ggml_backend_get_device(ctx->backend);
-    ggml_backend_buffer_type_t  buft = ggml_backend_dev_buffer_type(dev);
-    cg->alloc = ggml_gallocr_new(buft);
-    if (!ggml_gallocr_alloc_graph(cg->alloc, cg->gf)) {
-        fprintf(stderr, "%s: gallocr_alloc_graph failed (max_len=%d, n_batch=%d)\n",
-                __func__, max_len, n_batch);
-        return nullptr;
+    // -------------------------------------------------------------------------
+    // Allocate compute buffers.
+    //
+    // Single-backend path (cpu_fallback_backend == null):
+    //   Standard ggml_gallocr_new, exactly as before.
+    //
+    // Split-backend path (cpu_fallback_backend != null):
+    //   Use ggml_backend_sched so that the get_rows nodes (whose source tensors
+    //   live in cpu_weights_buffer) execute on the CPU backend, while all other
+    //   nodes execute on the primary GPU backend.  The scheduler handles cross-
+    //   backend copies automatically.
+    //
+    //   The three embedding weight tensors are already in CPU memory (allocated
+    //   into cpu_weights_buffer at load time), so the scheduler's heuristic —
+    //   "run an op on the backend that owns the largest input" — will naturally
+    //   route get_rows to CPU.  We enforce this explicitly below via
+    //   ggml_backend_sched_set_tensor_backend() to be robust regardless of which
+    //   heuristic ggml uses in future versions.
+    // -------------------------------------------------------------------------
+    if (!ctx->cpu_fallback_backend) {
+        // Standard single-backend allocation.
+        ggml_backend_dev_t          dev  = ggml_backend_get_device(ctx->backend);
+        ggml_backend_buffer_type_t  buft = ggml_backend_dev_buffer_type(dev);
+        cg->alloc = ggml_gallocr_new(buft);
+        if (!ggml_gallocr_alloc_graph(cg->alloc, cg->gf)) {
+            fprintf(stderr, "%s: gallocr_alloc_graph failed (max_len=%d, n_batch=%d)\n",
+                    __func__, max_len, n_batch);
+            return nullptr;
+        }
+    } else {
+        // Split-backend: create a scheduler with [cpu_fallback, primary].
+        // Order matters — ggml_backend_sched picks the first backend in the list
+        // whose buffer type matches a tensor, so list CPU first so it handles
+        // the already-CPU-resident embedding weight tensors.
+        ggml_backend_t backends[2] = { ctx->cpu_fallback_backend, ctx->backend };
+        ggml_backend_buffer_type_t buft_cpu = ggml_backend_get_default_buffer_type(ctx->cpu_fallback_backend);
+        ggml_backend_buffer_type_t buft_gpu = ggml_backend_get_default_buffer_type(ctx->backend);
+        ggml_backend_buffer_type_t bufts[2] = { buft_cpu, buft_gpu };
+
+        cg->sched = ggml_backend_sched_new(backends, bufts, 2, BERT_MAX_NODES, false, false);
+        if (!cg->sched) {
+            fprintf(stderr, "%s: ggml_backend_sched_new failed\n", __func__);
+            return nullptr;
+        }
+
+        // Explicitly pin the three embedding weight source tensors to the CPU
+        // backend so get_rows definitely runs there, even on future ggml versions.
+        const bert_model & m = ctx->model;
+        ggml_backend_sched_set_tensor_backend(cg->sched, m.word_embeddings,       ctx->cpu_fallback_backend);
+        ggml_backend_sched_set_tensor_backend(cg->sched, m.token_type_embeddings, ctx->cpu_fallback_backend);
+        ggml_backend_sched_set_tensor_backend(cg->sched, m.position_embeddings,   ctx->cpu_fallback_backend);
+
+        if (!ggml_backend_sched_alloc_graph(cg->sched, cg->gf)) {
+            fprintf(stderr, "%s: ggml_backend_sched_alloc_graph failed (max_len=%d, n_batch=%d)\n",
+                    __func__, max_len, n_batch);
+            return nullptr;
+        }
     }
 
     // ----------------------------------------------------------------------
@@ -1452,8 +1734,16 @@ void bert_forward_batch(bert_ctx * ctx, bert_batch batch,
 
     if (ggml_backend_is_cpu(ctx->backend))
         ggml_backend_cpu_set_n_threads(ctx->backend, n_threads);
+    if (ctx->cpu_fallback_backend)
+        ggml_backend_cpu_set_n_threads(ctx->cpu_fallback_backend, n_threads);
 
-    ggml_backend_graph_compute(ctx->backend, cg.gf);
+    if (cg.sched) {
+        // Split-backend path: the scheduler dispatches each node to whichever
+        // backend owns its input tensors (CPU for get_rows, GPU for everything else).
+        ggml_backend_sched_graph_compute(cg.sched, cg.gf);
+    } else {
+        ggml_backend_graph_compute(ctx->backend, cg.gf);
+    }
 
     ggml_backend_tensor_get(cg.output, embeddings, 0, ggml_nbytes(cg.output));
 

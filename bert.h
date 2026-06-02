@@ -84,6 +84,12 @@ struct bert_ctx {
     struct gguf_context * ctx_meta = nullptr;
     std::vector<uint8_t>  buf_compute_meta;
 
+    struct ggml_backend_sched * sched = nullptr; // scheduler property
+    // Added to support GPU primary and, when there's an op gap, a CPU fallback 
+    ggml_backend_t         cpu_fallback_backend; // null when GPU handles get_rows
+    ggml_backend_buffer_t  cpu_weights_buffer; // CPU-side embedding weights
+    struct ggml_context  * ctx_cpu_embd;         // ggml context owning the above
+
     ggml_backend_t        backend        = nullptr;
     ggml_backend_buffer_t weights_buffer = nullptr;
     ggml_backend_buffer_t compute_buffer = nullptr;
