@@ -103,11 +103,6 @@ extern "C" {
 //   probe) — the scheduling machinery is already in place.
 // ---------------------------------------------------------------------------
 
-// Extensibility
-// To handle a future gap in a different op (e.g. a Vulkan backend missing
-// ggml_flash_attn_ext for some quant), add a second probe call in bert_choose_backends
-// and extend cpu_tensor_names accordingly. 
-
 static bool bert_backend_supports_get_rows(struct ggml_backend * backend,
                                            enum ggml_type        weight_type) {
     if (!backend) return false;
@@ -1589,26 +1584,38 @@ build_cached_graph(bert_ctx * ctx, int max_len, int n_batch) {
         }
     } else {
         // Split-backend: create a scheduler with [cpu_fallback, primary].
-        // Order matters — ggml_backend_sched picks the first backend in the list
-        // whose buffer type matches a tensor, so list CPU first so it handles
-        // the already-CPU-resident embedding weight tensors.
-        ggml_backend_t backends[2] = { ctx->cpu_fallback_backend, ctx->backend };
-        ggml_backend_buffer_type_t buft_cpu = ggml_backend_get_default_buffer_type(ctx->cpu_fallback_backend);
-        ggml_backend_buffer_type_t buft_gpu = ggml_backend_get_default_buffer_type(ctx->backend);
-        ggml_backend_buffer_type_t bufts[2] = { buft_cpu, buft_gpu };
+        // ggml requires the CPU backend to be last in the array (hard assert in ggml_backend_sched_new).
+        // Order: [primary_gpu, cpu_fallback]
+        ggml_backend_t             backends[2] = { ctx->backend, ctx->cpu_fallback_backend };
+        ggml_backend_buffer_type_t buft_gpu    = ggml_backend_get_default_buffer_type(ctx->backend);
+        ggml_backend_buffer_type_t buft_cpu    = ggml_backend_get_default_buffer_type(ctx->cpu_fallback_backend);
+        ggml_backend_buffer_type_t bufts[2]    = { buft_gpu, buft_cpu };
 
+        // Args: backends, buffer_types, n_backends, graph_size, parallel
+        // parallel=false: ops execute sequentially (CPU get_rows feeds GPU); no pipeline overlap needed.
         cg->sched = ggml_backend_sched_new(backends, bufts, 2, BERT_MAX_NODES, false, false);
         if (!cg->sched) {
             fprintf(stderr, "%s: ggml_backend_sched_new failed\n", __func__);
             return nullptr;
         }
 
-        // Explicitly pin the three embedding weight source tensors to the CPU
-        // backend so get_rows definitely runs there, even on future ggml versions.
+        // Explicitly pin tensors that must be CPU-resident so get_rows can read them.
+        //
+        // Two categories:
+        //   1. Weight sources (already in cpu_weights_buffer): word/type/position embeddings.
+        //      The scheduler must know they live on CPU or it will try to copy them to GPU.
+        //   2. Index tensors (token_layer, token_types, positions): these are I32 input
+        //      tensors written each forward pass.  The CPU get_rows kernel reads them
+        //      directly; if the scheduler places them on GPU the kernel gets garbage and
+        //      the i01 bounds assert fires.  Pinning them to CPU keeps them in host memory
+        //      where both the fill code (ggml_backend_tensor_set) and the CPU kernel agree.
         const bert_model & m = ctx->model;
         ggml_backend_sched_set_tensor_backend(cg->sched, m.word_embeddings,       ctx->cpu_fallback_backend);
         ggml_backend_sched_set_tensor_backend(cg->sched, m.token_type_embeddings, ctx->cpu_fallback_backend);
         ggml_backend_sched_set_tensor_backend(cg->sched, m.position_embeddings,   ctx->cpu_fallback_backend);
+        ggml_backend_sched_set_tensor_backend(cg->sched, cg->token_layer,         ctx->cpu_fallback_backend);
+        ggml_backend_sched_set_tensor_backend(cg->sched, cg->token_types,         ctx->cpu_fallback_backend);
+        ggml_backend_sched_set_tensor_backend(cg->sched, cg->positions,           ctx->cpu_fallback_backend);
 
         if (!ggml_backend_sched_alloc_graph(cg->sched, cg->gf)) {
             fprintf(stderr, "%s: ggml_backend_sched_alloc_graph failed (max_len=%d, n_batch=%d)\n",
@@ -1726,7 +1733,10 @@ void bert_forward_batch(bert_ctx * ctx, bert_batch batch,
         // Workaround: CPU gallocr appears to reuse these slots between
         // compute calls even though they're flagged ggml_set_input. Metal
         // keeps them stable. Cheap to rewrite each call.
-        if (ggml_backend_is_cpu(ctx->backend)) {
+        // Also rewrite unconditionally in the split-backend case: positions and
+        // token_types are pinned to cpu_fallback_backend (CPU memory), but
+        // ctx->backend is CUDA so the old is-cpu guard would skip them.
+        if (ggml_backend_is_cpu(ctx->backend) || ctx->cpu_fallback_backend) {
             ggml_backend_tensor_set(cg.positions,   cg.scratch_pos.data(),   0, ggml_nbytes(cg.positions));
             ggml_backend_tensor_set(cg.token_types, cg.scratch_types.data(), 0, ggml_nbytes(cg.token_types));
         }
