@@ -135,6 +135,8 @@ struct bert_backend_choice {
 // On success, fills `out` and returns true.
 // On gap detection, frees `candidate`, sets cpu_fallback, and returns true.
 // On init failure, returns false.
+static int get_best_gpu_index(const std::string & backend_type);
+//
 static bool bert_try_gpu_backend(struct ggml_backend * candidate,
                                  enum ggml_type        weight_type,
                                  const char *          name,
@@ -1377,7 +1379,7 @@ struct bert_cached_graph {
     ggml_tensor * pad_mask    = nullptr;
     ggml_tensor * positions   = nullptr;  // pre-filled with [0..max_len-1] at build time
     ggml_tensor * sum         = nullptr;
-    ggml_tensor * minus_one   = nullptr;
+
     ggml_tensor * output      = nullptr;
 
     // Per-call scratch buffers — sized once per (max_len, n_batch) to avoid
@@ -1448,30 +1450,41 @@ build_cached_graph(bert_ctx * ctx, int max_len, int n_batch) {
     ggml_set_name(cg->token_layer, "token_layer");
     cg->token_types = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, max_len * n_batch);
     ggml_set_name(cg->token_types, "token_types");
-    cg->pad_mask    = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, max_len, 1, n_batch);
+    // pad_mask stores per-token mask values: 0.0 for real tokens, -100000.0 for padding.
+    // Two views of the same underlying buffer give a column [max_len,1] and row [1,max_len]
+    // vector per batch element.  ggml_add broadcasts them to [max_len,max_len,1,n_batch]:
+    //   real+real=0, real+pad=-100000, pad+real=-100000, pad+pad=-200000 (also masked).
+    // This matches flash_attn_ext's additive-bias convention and requires no extra ops.
+    // Filled in bert_forward_batch: 0.0f for real positions, -100000.0f for padding.
+    cg->pad_mask    = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, max_len, 1, 1, n_batch);
     ggml_set_name(cg->pad_mask, "pad_mask");
     cg->positions   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, max_len * n_batch);
     ggml_set_name(cg->positions, "positions");
     cg->sum         = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, max_len, 1, n_batch);
     ggml_set_name(cg->sum, "sum");
-    cg->minus_one   = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1);
-    ggml_set_name(cg->minus_one, "minus_one");
 
     ggml_set_input(cg->token_layer);
     ggml_set_input(cg->token_types);
     ggml_set_input(cg->pad_mask);
     ggml_set_input(cg->positions);
     ggml_set_input(cg->sum);
-    ggml_set_input(cg->minus_one);
 
-    // Attention mask: 0 for unmasked pairs, -large for masked.
-    // pad_mask [1, max_len, 1, n_batch] outer product -> [max_len, max_len, 1, n_batch]
-    ggml_tensor * attn_mask_f32 = ggml_mul_mat(ctx0, cg->pad_mask, cg->pad_mask);
-    attn_mask_f32 = ggml_scale_inplace(ctx0, attn_mask_f32, 100000.0f);
-    ggml_tensor * large_offset = ggml_scale(ctx0, cg->minus_one, 100000.0f);
-    attn_mask_f32 = ggml_add(ctx0, attn_mask_f32, large_offset);
+    // Attention mask: additive bias for flash_attn_ext.
+    // pad_mask holds per-token values {0.0=real, -100000.0=padding}, shape [max_len,1,1,n_batch].
+    //
+    // Build [max_len, max_len, 1, n_batch] mask where mask[i][j] = pad[i] + pad[j]:
+    //   1. View pad_mask as a row vector [max_len, 1, 1, n_batch]
+    //   2. ggml_repeat it to [max_len, max_len, 1, n_batch]  (each row is pad[:])
+    //   3. View pad_mask as a column vector [1, max_len, 1, n_batch]
+    //   4. ggml_add — [1,max_len] cleanly repeats into [max_len,max_len] along dim0
+    // Result: 0 for real-real pairs, -100000 for any pair involving padding.
+    struct ggml_tensor * mask_shape    = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, max_len, max_len, 1, n_batch);
+    struct ggml_tensor * row_mask      = ggml_reshape_4d(ctx0, cg->pad_mask, max_len, 1,       1, n_batch);
+    struct ggml_tensor * full_mask     = ggml_repeat(ctx0, row_mask, mask_shape);
+    struct ggml_tensor * col_mask      = ggml_reshape_4d(ctx0, cg->pad_mask, 1,       max_len, 1, n_batch);
+    struct ggml_tensor * attn_mask_f32 = ggml_add(ctx0, full_mask, col_mask);
     // flash_attn_ext requires f16 contiguous mask
-    ggml_tensor * attn_mask = ggml_cast(ctx0, attn_mask_f32, GGML_TYPE_F16);
+    struct ggml_tensor * attn_mask     = ggml_cast(ctx0, attn_mask_f32, GGML_TYPE_F16);
 
     // Embeddings — all shaped [n_embd, max_len, n_batch]
     ggml_tensor * word_embd = ggml_get_rows(ctx0, model.word_embeddings, cg->token_layer);
@@ -1626,11 +1639,9 @@ build_cached_graph(bert_ctx * ctx, int max_len, int n_batch) {
 
     // ----------------------------------------------------------------------
     // One-time fill for tensors that never vary across forwards at this shape:
-    //   - positions: always [0, 1, ..., max_len-1] for every batch element
+    //   - positions:   always [0, 1, ..., max_len-1] for every batch element
     //   - token_types: always 0 for sentence-embedding BERT
-    //   - minus_one: literal -1.0
-    // After this point the backend buffers hold the correct values forever,
-    // so bert_forward_batch can skip writing them on every call.
+    // After this point the backend buffers hold the correct values forever.
     // ----------------------------------------------------------------------
     {
         cg->scratch_pos.assign((size_t)max_len * n_batch, 0);
@@ -1638,11 +1649,9 @@ build_cached_graph(bert_ctx * ctx, int max_len, int n_batch) {
             for (int i = 0; i < max_len; ++i)
                 cg->scratch_pos[(size_t)ba * max_len + i] = i;
         cg->scratch_types.assign((size_t)max_len * n_batch, 0);
-        const float m1 = -1.0f;
 
         ggml_backend_tensor_set(cg->positions,   cg->scratch_pos.data(),   0, ggml_nbytes(cg->positions));
         ggml_backend_tensor_set(cg->token_types, cg->scratch_types.data(), 0, ggml_nbytes(cg->token_types));
-        ggml_backend_tensor_set(cg->minus_one,   &m1,                      0, sizeof(m1));
     }
 
     // Size per-call scratch once — every forward at this shape rewrites contents
@@ -1704,7 +1713,7 @@ void bert_forward_batch(bert_ctx * ctx, bert_batch batch,
     }
     bert_cached_graph & cg = *it->second;
 
-    // Fill per-call input buffers. positions / token_types / minus_one were
+    // Fill per-call input buffers. positions / token_types were
     // pre-filled at build time and never change. Scratch vectors are sized
     // once in build_cached_graph; we only rewrite their contents here.
     {
@@ -1718,12 +1727,12 @@ void bert_forward_batch(bert_ctx * ctx, bert_batch batch,
             const int row = ba * max_len;
             for (int i = 0; i < cl; ++i) {
                 tl[row + i] = batch[ba][i];
-                pm[row + i] = 1.0f;
+                pm[row + i] = 0.0f;       // real token: contributes 0 to attention bias
                 sv[row + i] = w;
             }
             for (int i = cl; i < max_len; ++i) {
                 tl[row + i] = 0;
-                pm[row + i] = 0.0f;
+                pm[row + i] = -100000.0f; // padding: masks out this position
                 sv[row + i] = 0.0f;
             }
         }
