@@ -95,3 +95,12 @@ All three wins also benefit Metal (graphs->MTL has its own, nocont+nomask are ba
 | bge-base     | 1.73->1.47 (-15%) | 3.85->3.28 (-15%) | 11.48->9.36 (-18%) | 126.6->114.1 (-10%) |
 | bge-large-q8 | 4.60->3.90 (-15%) | 10.91->9.27 (-15%) | 31.24->25.77 (-18%) | 352->314 (-11%) |
 Consistent with paired A/B. CPU path: bit-correct, timing unchanged (compute-bound, overhead is noise).
+
+### Exp7: fused QKV projection  [NO WIN — reverted]
+Implemented via post-load weight concat ([n_embd,3*n_embd]) + strided 4D views in the graph (no
+re-introduced conts). Correctness: f16 bit-identical (cos=1.0), q8_0 cos=0.99996 (one wide GEMM
+rounds differently than three narrow ones). Speed (paired env-toggle A/B, same binary): NEUTRAL —
+bge-base vshort 1.70/1.70, medium ~3.1/~3.1, max ~9.0/~9.0, bs32 ~119/~119. Reason: CUDA graphs
+already remove launch overhead and cuBLAS is already efficient; on a power-bound 35W GPU, 1 GEMM vs 3
+doesn't change FLOPs/power. Costs +25% weight memory and a q8 numerical drift. Reverted.
+Confirms: with graphs+nocont+nomask already in, the realistic low-hanging fruit is exhausted.
