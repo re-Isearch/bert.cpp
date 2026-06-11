@@ -87,3 +87,11 @@ Biggest on short single queries (the interactive/search case).
 | bge-large-q8 | 4.57 -> 3.67 (-20%) | 10.8 -> 9.39 (-13%) | 348 -> 319 (-8%) |
 Single-query latency improves most (the search-as-you-type path): -15..-42%. bit-identical output.
 All three wins also benefit Metal (graphs->MTL has its own, nocont+nomask are backend-agnostic ggml).
+
+## CLEAN ABSOLUTE final (all-opts build, GPU cool 45-60C) vs baseline (cool, session start)
+| model | very-short | medium | max(512) | bs=32 |
+|---|---|---|---|---|
+| bge-small    | 1.39->1.00 (-28%) | 3.02->2.43 (-20%) | 10.36->8.75 (-16%) | 80.8->76.6 (-5%) |
+| bge-base     | 1.73->1.47 (-15%) | 3.85->3.28 (-15%) | 11.48->9.36 (-18%) | 126.6->114.1 (-10%) |
+| bge-large-q8 | 4.60->3.90 (-15%) | 10.91->9.27 (-15%) | 31.24->25.77 (-18%) | 352->314 (-11%) |
+Consistent with paired A/B. CPU path: bit-correct, timing unchanged (compute-bound, overhead is noise).
