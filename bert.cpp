@@ -1525,10 +1525,12 @@ build_cached_graph(bert_ctx * ctx, int max_len, int n_batch) {
         // Projections produce [n_embd, max_len, n_batch]. Reshape+permute to
         // [d_head, max_len, n_head, n_batch] — the layout flash_attn_ext wants.
         // No ggml_cont needed; flash_attn handles non-contiguous q/k/v.
+        // EXP2: return the permuted *view* (no ggml_cont). flash_attn_ext accepts
+        // non-contiguous q/k/v, saving 3 full activation copies per layer.
         auto proj = [&](ggml_tensor * w, ggml_tensor * b) {
             ggml_tensor * x = ggml_add(ctx0, ggml_mul_mat(ctx0, w, cur), b);
             x = ggml_reshape_4d(ctx0, x, d_head, n_head, max_len, n_batch);
-            return ggml_cont(ctx0, ggml_permute(ctx0, x, 0, 2, 1, 3));
+            return ggml_permute(ctx0, x, 0, 2, 1, 3);
         };
         ggml_tensor * Q = proj(L.q_w, L.q_b);
         ggml_tensor * K = proj(L.k_w, L.k_b);
@@ -1550,8 +1552,10 @@ build_cached_graph(bert_ctx * ctx, int max_len, int n_batch) {
         } else {
             // Unfused scaled-dot-product attention (head dims flash_attn_ext can't
             // handle on accelerated backends, e.g. CUDA + head_dim 32).
-            // Q,K,V: [d_head, max_len, n_head, n_batch].
-            ggml_tensor * KQ = ggml_mul_mat(ctx0, K, Q);                  // [n_kv, n_q, n_head, n_batch]
+            // Q,K,V are non-contiguous permuted views (see EXP2); mul_mat needs
+            // a contiguous first operand, so cont K here.
+            ggml_tensor * Kc = ggml_cont(ctx0, K);
+            ggml_tensor * KQ = ggml_mul_mat(ctx0, Kc, Q);                 // [n_kv, n_q, n_head, n_batch]
             KQ = ggml_scale_inplace(ctx0, KQ, attn_scale);
             KQ = ggml_add(ctx0, KQ, attn_mask_f32);                       // additive bias, broadcast over heads
             KQ = ggml_soft_max(ctx0, KQ);
