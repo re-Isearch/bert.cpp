@@ -1435,6 +1435,21 @@ build_cached_graph(bert_ctx * ctx, int max_len, int n_batch) {
     const float layer_norm_eps = hp.layer_norm_eps;
     const int   d_head         = n_embd / n_head;
 
+    // flash_attn_ext on the CUDA backend only supports a fixed set of head
+    // dimensions (see ggml_cuda_get_best_fattn_kernel); head_dim 32 — used by
+    // all-MiniLM and bge-small (n_embd 384 / 12 heads) — is NOT among them and
+    // triggers GGML_ABORT("fatal error") inside the CUDA flash-attn dispatch.
+    // The CPU backend handles every head dim, so only gate accelerated backends.
+    // For unsupported dims fall back to an explicit (unfused) scaled-dot-product
+    // attention, which is numerically equivalent and works on every backend.
+    auto fattn_head_dim_ok = [](int dh) {
+        switch (dh) {
+            case 64: case 80: case 96: case 112: case 128: case 256: return true;
+            default: return false;
+        }
+    };
+    const bool use_flash = ggml_backend_is_cpu(ctx->backend) || fattn_head_dim_ok(d_head);
+
     auto cg = std::make_unique<bert_cached_graph>();
     cg->max_len = max_len;
     cg->n_batch = n_batch;
@@ -1478,13 +1493,25 @@ build_cached_graph(bert_ctx * ctx, int max_len, int n_batch) {
     //   3. View pad_mask as a column vector [1, max_len, 1, n_batch]
     //   4. ggml_add — [1,max_len] cleanly repeats into [max_len,max_len] along dim0
     // Result: 0 for real-real pairs, -100000 for any pair involving padding.
-    struct ggml_tensor * mask_shape    = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, max_len, max_len, 1, n_batch);
-    struct ggml_tensor * row_mask      = ggml_reshape_4d(ctx0, cg->pad_mask, max_len, 1,       1, n_batch);
-    struct ggml_tensor * full_mask     = ggml_repeat(ctx0, row_mask, mask_shape);
-    struct ggml_tensor * col_mask      = ggml_reshape_4d(ctx0, cg->pad_mask, 1,       max_len, 1, n_batch);
-    struct ggml_tensor * attn_mask_f32 = ggml_add(ctx0, full_mask, col_mask);
-    // flash_attn_ext requires f16 contiguous mask
-    struct ggml_tensor * attn_mask     = ggml_cast(ctx0, attn_mask_f32, GGML_TYPE_F16);
+    //
+    // EXP6: when n_batch==1, max_len == the single sequence length, so every
+    // position is a real token — there is never any padding and the mask is
+    // identically zero. Skip the whole mask subgraph (repeat+add+f16 cast) and
+    // pass a null mask, which also lets flash_attn_ext take its faster no-mask
+    // path. This is the latency-critical single-query / interactive case.
+    const bool need_mask = (n_batch > 1);
+    struct ggml_tensor * attn_mask_f32 = nullptr;
+    struct ggml_tensor * attn_mask     = nullptr;
+    if (need_mask) {
+        struct ggml_tensor * mask_shape = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, max_len, max_len, 1, n_batch);
+        struct ggml_tensor * row_mask   = ggml_reshape_4d(ctx0, cg->pad_mask, max_len, 1,       1, n_batch);
+        struct ggml_tensor * full_mask  = ggml_repeat(ctx0, row_mask, mask_shape);
+        struct ggml_tensor * col_mask   = ggml_reshape_4d(ctx0, cg->pad_mask, 1,       max_len, 1, n_batch);
+        attn_mask_f32 = ggml_add(ctx0, full_mask, col_mask);
+        // flash_attn_ext requires an f16 contiguous mask; the unfused path adds
+        // the f32 mask directly, so only cast when flash attention is used.
+        attn_mask = use_flash ? ggml_cast(ctx0, attn_mask_f32, GGML_TYPE_F16) : nullptr;
+    }
 
     // Embeddings — all shaped [n_embd, max_len, n_batch]
     ggml_tensor * word_embd = ggml_get_rows(ctx0, model.word_embeddings, cg->token_layer);
@@ -1509,10 +1536,12 @@ build_cached_graph(bert_ctx * ctx, int max_len, int n_batch) {
         // Projections produce [n_embd, max_len, n_batch]. Reshape+permute to
         // [d_head, max_len, n_head, n_batch] — the layout flash_attn_ext wants.
         // No ggml_cont needed; flash_attn handles non-contiguous q/k/v.
+        // EXP2: return the permuted *view* (no ggml_cont). flash_attn_ext accepts
+        // non-contiguous q/k/v, saving 3 full activation copies per layer.
         auto proj = [&](ggml_tensor * w, ggml_tensor * b) {
             ggml_tensor * x = ggml_add(ctx0, ggml_mul_mat(ctx0, w, cur), b);
             x = ggml_reshape_4d(ctx0, x, d_head, n_head, max_len, n_batch);
-            return ggml_cont(ctx0, ggml_permute(ctx0, x, 0, 2, 1, 3));
+            return ggml_permute(ctx0, x, 0, 2, 1, 3);
         };
         ggml_tensor * Q = proj(L.q_w, L.q_b);
         ggml_tensor * K = proj(L.k_w, L.k_b);
@@ -1525,11 +1554,27 @@ build_cached_graph(bert_ctx * ctx, int max_len, int n_batch) {
         // (native fp16 hw) with negligible numerical drift for sentence embeddings.
         // CPU has no native fp16 path, so F16 there would just upconvert and pay
         // extra work — force F32 in that case.
-        ggml_tensor * sdpa = ggml_flash_attn_ext(ctx0, Q, K, V, attn_mask,
-                                                 attn_scale, 0.0f, 0.0f);
-        if (ggml_backend_is_cpu(ctx->backend))
-            ggml_flash_attn_ext_set_prec(sdpa, GGML_PREC_F32);
-        cur = ggml_reshape_3d(ctx0, sdpa, n_embd, max_len, n_batch);
+        if (use_flash) {
+            ggml_tensor * sdpa = ggml_flash_attn_ext(ctx0, Q, K, V, attn_mask,
+                                                     attn_scale, 0.0f, 0.0f);
+            if (ggml_backend_is_cpu(ctx->backend))
+                ggml_flash_attn_ext_set_prec(sdpa, GGML_PREC_F32);
+            cur = ggml_reshape_3d(ctx0, sdpa, n_embd, max_len, n_batch);
+        } else {
+            // Unfused scaled-dot-product attention (head dims flash_attn_ext can't
+            // handle on accelerated backends, e.g. CUDA + head_dim 32).
+            // Q,K,V are non-contiguous permuted views (see EXP2); mul_mat needs
+            // a contiguous first operand, so cont K here.
+            ggml_tensor * Kc = ggml_cont(ctx0, K);
+            ggml_tensor * KQ = ggml_mul_mat(ctx0, Kc, Q);                 // [n_kv, n_q, n_head, n_batch]
+            KQ = ggml_scale_inplace(ctx0, KQ, attn_scale);
+            if (need_mask) KQ = ggml_add(ctx0, KQ, attn_mask_f32);        // additive bias, broadcast over heads
+            KQ = ggml_soft_max(ctx0, KQ);
+            ggml_tensor * Vt  = ggml_cont(ctx0, ggml_transpose(ctx0, V)); // [n_kv, d_head, n_head, n_batch]
+            ggml_tensor * KQV = ggml_mul_mat(ctx0, Vt, KQ);              // [d_head, n_q, n_head, n_batch]
+            KQV = ggml_cont(ctx0, ggml_permute(ctx0, KQV, 0, 2, 1, 3));  // [d_head, n_head, n_q, n_batch]
+            cur = ggml_reshape_3d(ctx0, KQV, n_embd, max_len, n_batch);
+        }
 
         // Output projection + residual + post-attention LayerNorm
         cur = ggml_add(ctx0, ggml_mul_mat(ctx0, L.o_w, cur), L.o_b);
@@ -1737,7 +1782,10 @@ void bert_forward_batch(bert_ctx * ctx, bert_batch batch,
             }
         }
         ggml_backend_tensor_set(cg.token_layer, tl, 0, ggml_nbytes(cg.token_layer));
-        ggml_backend_tensor_set(cg.pad_mask,    pm, 0, ggml_nbytes(cg.pad_mask));
+        // pad_mask is only built into the graph (and thus allocated) when n_batch>1;
+        // for n_batch==1 there is no padding and the mask subgraph is skipped (EXP6).
+        if (n_batch > 1)
+            ggml_backend_tensor_set(cg.pad_mask, pm, 0, ggml_nbytes(cg.pad_mask));
         ggml_backend_tensor_set(cg.sum,         sv, 0, ggml_nbytes(cg.sum));
         // Workaround: CPU gallocr appears to reuse these slots between
         // compute calls even though they're flagged ggml_set_input. Metal
@@ -1745,10 +1793,13 @@ void bert_forward_batch(bert_ctx * ctx, bert_batch batch,
         // Also rewrite unconditionally in the split-backend case: positions and
         // token_types are pinned to cpu_fallback_backend (CPU memory), but
         // ctx->backend is CUDA so the old is-cpu guard would skip them.
-        if (ggml_backend_is_cpu(ctx->backend) || ctx->cpu_fallback_backend) {
-            ggml_backend_tensor_set(cg.positions,   cg.scratch_pos.data(),   0, ggml_nbytes(cg.positions));
-            ggml_backend_tensor_set(cg.token_types, cg.scratch_types.data(), 0, ggml_nbytes(cg.token_types));
-        }
+        // NOTE: must re-upload on EVERY backend (incl. pure CUDA), not just CPU.
+        // gallocr reuses these ggml_set_input slots for later compute intermediates
+        // between forwards, so positions/token_types are clobbered after the first
+        // compute. Skipping the refresh on CUDA fed get_rows garbage indices ->
+        // out-of-bounds read on the embedding table (illegal memory access).
+        ggml_backend_tensor_set(cg.positions,   cg.scratch_pos.data(),   0, ggml_nbytes(cg.positions));
+        ggml_backend_tensor_set(cg.token_types, cg.scratch_types.data(), 0, ggml_nbytes(cg.token_types));
     }
 
     if (ggml_backend_is_cpu(ctx->backend))
