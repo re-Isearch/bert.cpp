@@ -1745,10 +1745,13 @@ void bert_forward_batch(bert_ctx * ctx, bert_batch batch,
         // Also rewrite unconditionally in the split-backend case: positions and
         // token_types are pinned to cpu_fallback_backend (CPU memory), but
         // ctx->backend is CUDA so the old is-cpu guard would skip them.
-        if (ggml_backend_is_cpu(ctx->backend) || ctx->cpu_fallback_backend) {
-            ggml_backend_tensor_set(cg.positions,   cg.scratch_pos.data(),   0, ggml_nbytes(cg.positions));
-            ggml_backend_tensor_set(cg.token_types, cg.scratch_types.data(), 0, ggml_nbytes(cg.token_types));
-        }
+        // NOTE: must re-upload on EVERY backend (incl. pure CUDA), not just CPU.
+        // gallocr reuses these ggml_set_input slots for later compute intermediates
+        // between forwards, so positions/token_types are clobbered after the first
+        // compute. Skipping the refresh on CUDA fed get_rows garbage indices ->
+        // out-of-bounds read on the embedding table (illegal memory access).
+        ggml_backend_tensor_set(cg.positions,   cg.scratch_pos.data(),   0, ggml_nbytes(cg.positions));
+        ggml_backend_tensor_set(cg.token_types, cg.scratch_types.data(), 0, ggml_nbytes(cg.token_types));
     }
 
     if (ggml_backend_is_cpu(ctx->backend))
