@@ -1493,14 +1493,25 @@ build_cached_graph(bert_ctx * ctx, int max_len, int n_batch) {
     //   3. View pad_mask as a column vector [1, max_len, 1, n_batch]
     //   4. ggml_add — [1,max_len] cleanly repeats into [max_len,max_len] along dim0
     // Result: 0 for real-real pairs, -100000 for any pair involving padding.
-    struct ggml_tensor * mask_shape    = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, max_len, max_len, 1, n_batch);
-    struct ggml_tensor * row_mask      = ggml_reshape_4d(ctx0, cg->pad_mask, max_len, 1,       1, n_batch);
-    struct ggml_tensor * full_mask     = ggml_repeat(ctx0, row_mask, mask_shape);
-    struct ggml_tensor * col_mask      = ggml_reshape_4d(ctx0, cg->pad_mask, 1,       max_len, 1, n_batch);
-    struct ggml_tensor * attn_mask_f32 = ggml_add(ctx0, full_mask, col_mask);
-    // flash_attn_ext requires an f16 contiguous mask; the unfused path adds the
-    // f32 mask directly, so only build the cast when flash attention is used.
-    struct ggml_tensor * attn_mask     = use_flash ? ggml_cast(ctx0, attn_mask_f32, GGML_TYPE_F16) : nullptr;
+    //
+    // EXP6: when n_batch==1, max_len == the single sequence length, so every
+    // position is a real token — there is never any padding and the mask is
+    // identically zero. Skip the whole mask subgraph (repeat+add+f16 cast) and
+    // pass a null mask, which also lets flash_attn_ext take its faster no-mask
+    // path. This is the latency-critical single-query / interactive case.
+    const bool need_mask = (n_batch > 1);
+    struct ggml_tensor * attn_mask_f32 = nullptr;
+    struct ggml_tensor * attn_mask     = nullptr;
+    if (need_mask) {
+        struct ggml_tensor * mask_shape = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, max_len, max_len, 1, n_batch);
+        struct ggml_tensor * row_mask   = ggml_reshape_4d(ctx0, cg->pad_mask, max_len, 1,       1, n_batch);
+        struct ggml_tensor * full_mask  = ggml_repeat(ctx0, row_mask, mask_shape);
+        struct ggml_tensor * col_mask   = ggml_reshape_4d(ctx0, cg->pad_mask, 1,       max_len, 1, n_batch);
+        attn_mask_f32 = ggml_add(ctx0, full_mask, col_mask);
+        // flash_attn_ext requires an f16 contiguous mask; the unfused path adds
+        // the f32 mask directly, so only cast when flash attention is used.
+        attn_mask = use_flash ? ggml_cast(ctx0, attn_mask_f32, GGML_TYPE_F16) : nullptr;
+    }
 
     // Embeddings — all shaped [n_embd, max_len, n_batch]
     ggml_tensor * word_embd = ggml_get_rows(ctx0, model.word_embeddings, cg->token_layer);
@@ -1557,7 +1568,7 @@ build_cached_graph(bert_ctx * ctx, int max_len, int n_batch) {
             ggml_tensor * Kc = ggml_cont(ctx0, K);
             ggml_tensor * KQ = ggml_mul_mat(ctx0, Kc, Q);                 // [n_kv, n_q, n_head, n_batch]
             KQ = ggml_scale_inplace(ctx0, KQ, attn_scale);
-            KQ = ggml_add(ctx0, KQ, attn_mask_f32);                       // additive bias, broadcast over heads
+            if (need_mask) KQ = ggml_add(ctx0, KQ, attn_mask_f32);        // additive bias, broadcast over heads
             KQ = ggml_soft_max(ctx0, KQ);
             ggml_tensor * Vt  = ggml_cont(ctx0, ggml_transpose(ctx0, V)); // [n_kv, d_head, n_head, n_batch]
             ggml_tensor * KQV = ggml_mul_mat(ctx0, Vt, KQ);              // [d_head, n_q, n_head, n_batch]
@@ -1771,7 +1782,10 @@ void bert_forward_batch(bert_ctx * ctx, bert_batch batch,
             }
         }
         ggml_backend_tensor_set(cg.token_layer, tl, 0, ggml_nbytes(cg.token_layer));
-        ggml_backend_tensor_set(cg.pad_mask,    pm, 0, ggml_nbytes(cg.pad_mask));
+        // pad_mask is only built into the graph (and thus allocated) when n_batch>1;
+        // for n_batch==1 there is no padding and the mask subgraph is skipped (EXP6).
+        if (n_batch > 1)
+            ggml_backend_tensor_set(cg.pad_mask, pm, 0, ggml_nbytes(cg.pad_mask));
         ggml_backend_tensor_set(cg.sum,         sv, 0, ggml_nbytes(cg.sum));
         // Workaround: CPU gallocr appears to reuse these slots between
         // compute calls even though they're flagged ggml_set_input. Metal

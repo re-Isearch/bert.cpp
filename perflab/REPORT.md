@@ -72,3 +72,18 @@ GPU is 35W power-bound at ~6 TFLOP/s so overhead-reduction is the right lever, n
 
 NOTE: 35W laptop GPU thermally throttles under sustained load (max latency ~2x after ~30min). Real
 deployments on desktop/server CUDA or Metal will see steadier numbers; relative speedups hold.
+
+### Exp6: skip attention mask for n_batch==1  [WIN — adopt]
+When n_batch==1, max_len==seq_len so there is never padding; the mask is identically 0. Skip the
+mask subgraph (repeat+add+f16 cast) and pass null mask -> flash_attn_ext faster no-mask path.
+Guarded pad_mask upload to n_batch>1 (else gallocr never allocates it). cos=1.0 all models.
+Biggest on short single queries (the interactive/search case).
+
+## FINAL STACK (graphs + no-cont + null-mask-bs1) vs ORIGINAL baseline — paired A/B, cos=1.0
+| model | very-short | medium | bs=32 |
+|---|---|---|---|
+| bge-small    | 1.39 -> 0.80 (-42%) | 2.29 -> 1.84 (-20%) | 80.7 -> 78 (-3%) |
+| bge-base     | 1.72 -> 1.46 (-15%) | 3.5  -> 2.91 (-18%) | 128 -> 117 (-9%) |
+| bge-large-q8 | 4.57 -> 3.67 (-20%) | 10.8 -> 9.39 (-13%) | 348 -> 319 (-8%) |
+Single-query latency improves most (the search-as-you-type path): -15..-42%. bit-identical output.
+All three wins also benefit Metal (graphs->MTL has its own, nocont+nomask are backend-agnostic ggml).
