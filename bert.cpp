@@ -1435,6 +1435,21 @@ build_cached_graph(bert_ctx * ctx, int max_len, int n_batch) {
     const float layer_norm_eps = hp.layer_norm_eps;
     const int   d_head         = n_embd / n_head;
 
+    // flash_attn_ext on the CUDA backend only supports a fixed set of head
+    // dimensions (see ggml_cuda_get_best_fattn_kernel); head_dim 32 — used by
+    // all-MiniLM and bge-small (n_embd 384 / 12 heads) — is NOT among them and
+    // triggers GGML_ABORT("fatal error") inside the CUDA flash-attn dispatch.
+    // The CPU backend handles every head dim, so only gate accelerated backends.
+    // For unsupported dims fall back to an explicit (unfused) scaled-dot-product
+    // attention, which is numerically equivalent and works on every backend.
+    auto fattn_head_dim_ok = [](int dh) {
+        switch (dh) {
+            case 64: case 80: case 96: case 112: case 128: case 256: return true;
+            default: return false;
+        }
+    };
+    const bool use_flash = ggml_backend_is_cpu(ctx->backend) || fattn_head_dim_ok(d_head);
+
     auto cg = std::make_unique<bert_cached_graph>();
     cg->max_len = max_len;
     cg->n_batch = n_batch;
@@ -1483,8 +1498,9 @@ build_cached_graph(bert_ctx * ctx, int max_len, int n_batch) {
     struct ggml_tensor * full_mask     = ggml_repeat(ctx0, row_mask, mask_shape);
     struct ggml_tensor * col_mask      = ggml_reshape_4d(ctx0, cg->pad_mask, 1,       max_len, 1, n_batch);
     struct ggml_tensor * attn_mask_f32 = ggml_add(ctx0, full_mask, col_mask);
-    // flash_attn_ext requires f16 contiguous mask
-    struct ggml_tensor * attn_mask     = ggml_cast(ctx0, attn_mask_f32, GGML_TYPE_F16);
+    // flash_attn_ext requires an f16 contiguous mask; the unfused path adds the
+    // f32 mask directly, so only build the cast when flash attention is used.
+    struct ggml_tensor * attn_mask     = use_flash ? ggml_cast(ctx0, attn_mask_f32, GGML_TYPE_F16) : nullptr;
 
     // Embeddings — all shaped [n_embd, max_len, n_batch]
     ggml_tensor * word_embd = ggml_get_rows(ctx0, model.word_embeddings, cg->token_layer);
@@ -1525,11 +1541,25 @@ build_cached_graph(bert_ctx * ctx, int max_len, int n_batch) {
         // (native fp16 hw) with negligible numerical drift for sentence embeddings.
         // CPU has no native fp16 path, so F16 there would just upconvert and pay
         // extra work — force F32 in that case.
-        ggml_tensor * sdpa = ggml_flash_attn_ext(ctx0, Q, K, V, attn_mask,
-                                                 attn_scale, 0.0f, 0.0f);
-        if (ggml_backend_is_cpu(ctx->backend))
-            ggml_flash_attn_ext_set_prec(sdpa, GGML_PREC_F32);
-        cur = ggml_reshape_3d(ctx0, sdpa, n_embd, max_len, n_batch);
+        if (use_flash) {
+            ggml_tensor * sdpa = ggml_flash_attn_ext(ctx0, Q, K, V, attn_mask,
+                                                     attn_scale, 0.0f, 0.0f);
+            if (ggml_backend_is_cpu(ctx->backend))
+                ggml_flash_attn_ext_set_prec(sdpa, GGML_PREC_F32);
+            cur = ggml_reshape_3d(ctx0, sdpa, n_embd, max_len, n_batch);
+        } else {
+            // Unfused scaled-dot-product attention (head dims flash_attn_ext can't
+            // handle on accelerated backends, e.g. CUDA + head_dim 32).
+            // Q,K,V: [d_head, max_len, n_head, n_batch].
+            ggml_tensor * KQ = ggml_mul_mat(ctx0, K, Q);                  // [n_kv, n_q, n_head, n_batch]
+            KQ = ggml_scale_inplace(ctx0, KQ, attn_scale);
+            KQ = ggml_add(ctx0, KQ, attn_mask_f32);                       // additive bias, broadcast over heads
+            KQ = ggml_soft_max(ctx0, KQ);
+            ggml_tensor * Vt  = ggml_cont(ctx0, ggml_transpose(ctx0, V)); // [n_kv, d_head, n_head, n_batch]
+            ggml_tensor * KQV = ggml_mul_mat(ctx0, Vt, KQ);              // [d_head, n_q, n_head, n_batch]
+            KQV = ggml_cont(ctx0, ggml_permute(ctx0, KQV, 0, 2, 1, 3));  // [d_head, n_head, n_q, n_batch]
+            cur = ggml_reshape_3d(ctx0, KQV, n_embd, max_len, n_batch);
+        }
 
         // Output projection + residual + post-attention LayerNorm
         cur = ggml_add(ctx0, ggml_mul_mat(ctx0, L.o_w, cur), L.o_b);
