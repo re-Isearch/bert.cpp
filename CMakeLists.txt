@@ -97,8 +97,11 @@ endif()
 #
 # Build libraries
 #
+if(NOT TARGET ggml)
+    add_subdirectory(ggml)
+endif()
 
-add_subdirectory(ggml)
+
 add_subdirectory(examples)
 add_subdirectory(models)
 
