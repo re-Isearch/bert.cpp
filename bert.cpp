@@ -253,6 +253,72 @@ static float get_f32(const struct gguf_context * ctx, const char * key) {
     return (i == -1) ? 1e-12f : gguf_get_val_f32(ctx, i);
 }
 
+static bool configure_embeddings(bert_ctx * ctx, const gguf_context * meta) {
+    auto & config = ctx->embedding;
+    const auto & vocab = ctx->vocab;
+    auto token = [&](std::initializer_list<const char *> names, bert_token fallback) {
+        for (const char * name : names) {
+            const auto found = vocab.token_to_id.find(name);
+            if (found != vocab.token_to_id.end()) return found->second;
+        }
+        return fallback;
+    };
+    auto metadata_id = [&](std::initializer_list<const char *> keys, bert_token fallback) {
+        for (const char * key : keys)
+            if (gguf_find_key(meta, key) >= 0) return bert_token(get_u32_robust(meta, {key}));
+        return fallback;
+    };
+    config.cls_token = metadata_id({"tokenizer.ggml.cls_token_id", "tokenizer.ggml.bos_token_id"},
+                                    token({"[CLS]", "<s>"}, config.cls_token));
+    config.sep_token = metadata_id({"tokenizer.ggml.sep_token_id", "tokenizer.ggml.eos_token_id"},
+                                    token({"[SEP]", "</s>"}, config.sep_token));
+    config.unk_token = metadata_id({"tokenizer.ggml.unknown_token_id", "tokenizer.ggml.unk_token_id"},
+                                    token({"[UNK]", "<unk>"}, config.unk_token));
+    config.pad_token = metadata_id({"tokenizer.ggml.padding_token_id", "tokenizer.ggml.pad_token_id"},
+                                    token({"[PAD]", "<pad>"}, config.pad_token));
+    for (const bert_token id : {config.cls_token, config.sep_token, config.unk_token, config.pad_token}) {
+        if (id < 0 || size_t(id) >= vocab.tokens.size()) {
+            ggml_log_internal(GGML_LOG_LEVEL_ERROR, "bert: special token id %d is outside the vocabulary\n", id);
+            return false;
+        }
+    }
+    std::string arch = ctx->model_arch, name = ctx->model_name;
+    std::transform(arch.begin(), arch.end(), arch.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+    std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+    config.roberta_positions = arch.find("roberta") != std::string::npos ||
+        (vocab.token_to_id.count("<s>") && vocab.token_to_id.count("</s>") && vocab.token_to_id.count("<pad>"));
+    config.lowercase = !config.roberta_positions;
+    const int lower_key = gguf_find_key(meta, "tokenizer.ggml.do_lower_case");
+    if (lower_key >= 0) {
+        if (gguf_get_kv_type(meta, lower_key) != GGUF_TYPE_BOOL) {
+            ggml_log_internal(GGML_LOG_LEVEL_ERROR, "bert: tokenizer.ggml.do_lower_case must be boolean\n");
+            return false;
+        }
+        config.lowercase = gguf_get_val_bool(meta, lower_key);
+    }
+    const bool bge_encoder = name.find("bge") != std::string::npos;
+    config.pooling = bge_encoder ?
+                      bert_pooling_type::CLS : bert_pooling_type::MEAN;
+    for (const auto & key : {ctx->model_arch + ".pooling_type", std::string("bert.pooling_type"),
+                             std::string("pooling_type")}) {
+        if (gguf_find_key(meta, key.c_str()) < 0) continue;
+        const auto value = get_u32_robust(meta, {key});
+        if (value < 1 || value > 3) {
+            ggml_log_internal(GGML_LOG_LEVEL_ERROR, "bert: unsupported sentence pooling type %u\n", value);
+            return false;
+        }
+        config.pooling = bert_pooling_type(value);
+        break;
+    }
+    if (bge_encoder && config.pooling != bert_pooling_type::CLS)
+        ggml_log_internal(GGML_LOG_LEVEL_WARN, "bert: BGE encoder declares non-CLS pooling; verify GGUF metadata\n");
+    ggml_log_internal(GGML_LOG_LEVEL_INFO,
+        "bert: embedding profile cls=%d sep=%d unk=%d pad=%d lowercase=%d position_offset=%d pooling=%d\n",
+        config.cls_token, config.sep_token, config.unk_token, config.pad_token, int(config.lowercase),
+        config.roberta_positions ? config.pad_token + 1 : 0, int(config.pooling));
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // Tensor lookup helpers
 // ---------------------------------------------------------------------------
@@ -340,13 +406,15 @@ static std::string bert_normalize_prompt(const std::string & text) {
 
 // WordPiece 
 bert_tokens bert_tokenize_wordpiece(bert_ctx * ctx, bert_string text, uint64_t n_max_tokens) {
-    constexpr int CLS = 101, SEP = 102, UNK = 100;
+    if (n_max_tokens < 2) return {};
+    const auto & config = ctx->embedding;
+    const bert_token CLS = config.cls_token, SEP = config.sep_token, UNK = config.unk_token;
     const bert_vocab & vocab = ctx->vocab;
 
     //fprintf(stderr, "[BERT_TOKENIZE] ctx=%p vocab.token_to_id.size=%zu\n", (void*)ctx, ctx->vocab.token_to_id.size());
 
     // Normalize: lowercase + strip accents
-    std::string ori = bert_normalize_prompt(text);
+    std::string ori = config.lowercase ? bert_normalize_prompt(text) : text;
 
     // Insert spaces around punctuation and Chinese characters
     std::string spaced;
@@ -385,6 +453,7 @@ bert_tokens bert_tokenize_wordpiece(bert_ctx * ctx, bert_string text, uint64_t n
     // If any fragment cannot be matched, replace the whole word with [UNK].
     // ---------------------------------------------------------------------------
     for (const auto & word : words) {
+        if (tokens.size() >= n_max_tokens - 1) break;
         const int n = (int)word.size();
         if (!n) continue;
 
@@ -533,7 +602,9 @@ static int get_best_gpu_index(const std::string & backend_type) {
 // bert_tokenize  (replaces the WordPiece version)
 // ---------------------------------------------------------------------------
 bert_tokens bert_tokenize(bert_ctx * ctx, bert_string text, uint64_t n_max_tokens) {
-    constexpr int CLS = 101, SEP = 102, UNK = 100;
+    if (n_max_tokens < 2) return {};
+    const auto & config = ctx->embedding;
+    const bert_token CLS = config.cls_token, SEP = config.sep_token, UNK = config.unk_token;
     const bert_vocab & vocab = ctx->vocab;
     const std::string SP = "\xe2\x96\x81"; // UTF-8 encoding of ▁ (U+2581)
 
@@ -542,12 +613,12 @@ bert_tokens bert_tokenize(bert_ctx * ctx, bert_string text, uint64_t n_max_token
       return bert_tokenize_wordpiece(ctx, text, n_max_tokens);
     } 
 
-    // Lowercase only — SentencePiece does not strip accents
+    // Follow the model's casing convention; XLM-R/M3 is case-sensitive.
     std::string normalized;
     for (size_t i = 0; i < text.size(); ) {
         const int cl = utf8_len(text[i]);
         if (cl == 1) {
-            normalized += (char)tolower((unsigned char)text[i]);
+            normalized += config.lowercase ? char(tolower((unsigned char)text[i])) : text[i];
             i++;
         } else {
             normalized += text.substr(i, cl);
@@ -576,6 +647,7 @@ bert_tokens bert_tokenize(bert_ctx * ctx, bert_string text, uint64_t n_max_token
     // If any fragment has no match, emit [UNK] for the whole word.
     // -------------------------------------------------------------------------
     for (const auto & word : words) {
+        if (tokens.size() >= n_max_tokens - 1) break;
         const int n = (int)word.size();
         if (!n) continue;
 
@@ -657,24 +729,32 @@ BERT_API struct bert_ctx * bert_load_from_file(const char * fname, bool use_cpu)
         const char * arch  = get_string_c(ctx_gguf, "general.architecture");
         if (arch)  bctx->model_arch = arch;
     }
+    if (bctx->model_name.empty()) {
+        const std::string path = fname;
+        const auto slash = path.find_last_of("/\\");
+        bctx->model_name = path.substr(slash == std::string::npos ? 0 : slash + 1);
+    }
     bctx->ctx_meta = ctx_gguf;
 
-    // Hyperparameters
+    // Hyperparameters (XLM-R exports may use their own architecture prefix).
     {
+        const std::string prefix = bctx->model_arch + ".";
         const int v_id = gguf_find_key(ctx_gguf, KEY_TOKEN_LIST);
         hp.n_vocab        = (v_id != -1) ? (uint32_t)gguf_get_arr_n(ctx_gguf, v_id) : 0;
-        hp.n_max_tokens   = get_u32_robust(ctx_gguf, {"bert.context_length",
+        hp.n_max_tokens   = get_u32_robust(ctx_gguf, {prefix + "context_length", "bert.context_length",
                                 "qwen2.context_length", "llama.context_length",
                                 "general.context_length"});
-        hp.n_embd         = get_u32_robust(ctx_gguf, {"bert.embedding_length",
+        hp.n_embd         = get_u32_robust(ctx_gguf, {prefix + "embedding_length", "bert.embedding_length",
                                 "qwen2.embedding_length", "general.embedding_length"});
-        hp.n_intermediate = get_u32_robust(ctx_gguf, {"bert.feed_forward_length",
+        hp.n_intermediate = get_u32_robust(ctx_gguf, {prefix + "feed_forward_length", "bert.feed_forward_length",
                                 "qwen2.feed_forward_length", "general.feed_forward_length"});
-        hp.n_head         = get_u32_robust(ctx_gguf, {"bert.attention.head_count",
+        hp.n_head         = get_u32_robust(ctx_gguf, {prefix + "attention.head_count", "bert.attention.head_count",
                                 "qwen2.attention.head_count", "general.num_attention_heads"});
-        hp.n_layer        = get_u32_robust(ctx_gguf, {"bert.block_count",
+        hp.n_layer        = get_u32_robust(ctx_gguf, {prefix + "block_count", "bert.block_count",
                                 "qwen2.block_count", "general.block_count"});
-        hp.layer_norm_eps = get_f32(ctx_gguf, "bert.attention.layer_norm_epsilon");
+        const std::string eps_key = prefix + "attention.layer_norm_epsilon";
+        hp.layer_norm_eps = get_f32(ctx_gguf, gguf_find_key(ctx_gguf, eps_key.c_str()) >= 0 ?
+                                    eps_key.c_str() : "bert.attention.layer_norm_epsilon");
     }
 
     // Vocabulary — SentencePiece style
@@ -684,31 +764,65 @@ BERT_API struct bert_ctx * bert_load_from_file(const char * fname, bool use_cpu)
             const int n = gguf_get_arr_n(ctx_gguf, v_id);
             vocab.tokens.resize(n);
 
-            const std::string probe = gguf_get_arr_str(ctx_gguf, v_id, 999);
-            bctx->vocab.is_sentencepiece = (probe.size() >= 3 && (unsigned char)probe[0] == 0xe2 &&
-                (unsigned char)probe[1] == 0x96 && (unsigned char)probe[2] == 0x81);
-            ggml_log_internal(GGML_LOG_LEVEL_INFO, "%s: vocab type: %s (probe token 999='%s')\n",
-                __func__, bctx->vocab.is_sentencepiece ? "SentencePiece (▁)" : "WordPiece (##)", probe.c_str());
+            // A single arbitrary token is not a tokenizer-family discriminator,
+            // and vocabularies smaller than 1000 have no token 999.
+            bool has_space_pieces = false, has_wordpiece_continuations = false;
+            bool has_bos = false, has_eos = false;
+            for (int i = 0; i < n; ++i) {
+                const std::string piece = gguf_get_arr_str(ctx_gguf, v_id, i);
+                has_space_pieces |= piece.compare(0, 3, "\xe2\x96\x81") == 0;
+                has_wordpiece_continuations |= piece.size() > 2 && piece.compare(0, 2, "##") == 0;
+                has_bos |= piece == "<s>";
+                has_eos |= piece == "</s>";
+            }
+            vocab.is_sentencepiece = (has_bos && has_eos) || (has_space_pieces && !has_wordpiece_continuations);
+            ggml_log_internal(GGML_LOG_LEVEL_INFO, "%s: vocab type: %s\n",
+                __func__, vocab.is_sentencepiece ? "SentencePiece (▁)" : "WordPiece (##)");
+            const int ids_key = gguf_find_key(ctx_gguf, "tokenizer.ggml.token_ids");
+            const auto ids_type = ids_key >= 0 ? gguf_get_arr_type(ctx_gguf, ids_key) : GGUF_TYPE_INT32;
+            if (ids_key >= 0 && (gguf_get_arr_n(ctx_gguf, ids_key) != size_t(n) ||
+                                (ids_type != GGUF_TYPE_INT32 && ids_type != GGUF_TYPE_UINT32))) {
+                ggml_log_internal(GGML_LOG_LEVEL_ERROR, "bert: invalid tokenizer.ggml.token_ids array\n");
+                gguf_free(ctx_gguf); ggml_free(ctx_ggml); delete bctx;
+                return nullptr;
+            }
 
             for (int i = 0; i < n; ++i) {
                 const std::string tok = gguf_get_arr_str(ctx_gguf, v_id, i);
+                const int64_t mapped_id = ids_key < 0 ? i : ids_type == GGUF_TYPE_UINT32 ?
+                    int64_t(static_cast<const uint32_t*>(gguf_get_arr_data(ctx_gguf, ids_key))[i]) :
+                    int64_t(static_cast<const int32_t*>(gguf_get_arr_data(ctx_gguf, ids_key))[i]);
+                if (mapped_id < 0 || mapped_id >= n) {
+                    ggml_log_internal(GGML_LOG_LEVEL_ERROR, "bert: vocabulary token id is out of range\n");
+                    gguf_free(ctx_gguf); ggml_free(ctx_ggml); delete bctx;
+                    return nullptr;
+                }
+                const int true_id = int(mapped_id);
+                vocab.tokens[true_id] = tok;
                 if (bctx->vocab.is_sentencepiece) {
-                    vocab.tokens[i]        = tok;
-                    vocab.token_to_id[tok] = i;
-                    vocab._id_to_token[i]  = tok;
+                    vocab.token_to_id[tok] = true_id;
+                    vocab._id_to_token[true_id] = tok;
                 } else {
-                    vocab.tokens[i]        = tok;
                     if (tok.size() > 2 && tok.substr(0, 2) == "##") {
-                        vocab.subword_token_to_id[tok]      = i;
-                        vocab._id_to_subword_token[i]       = tok;
+                        vocab.subword_token_to_id[tok] = true_id;
+                        vocab._id_to_subword_token[true_id] = tok;
                     } else {
-                        vocab.token_to_id[tok] = i;
-                        vocab._id_to_token[i]  = tok;
+                        vocab.token_to_id[tok] = true_id;
+                        vocab._id_to_token[true_id] = tok;
                     }
                 }
             }
         }
     }
+
+    if (!configure_embeddings(bctx, ctx_gguf)) {
+        gguf_free(ctx_gguf); ggml_free(ctx_ggml); delete bctx;
+        return nullptr;
+    }
+    const std::string arch_eps = bctx->model_arch + ".attention.layer_norm_epsilon";
+    if (bctx->embedding.roberta_positions && gguf_find_key(ctx_gguf, arch_eps.c_str()) < 0 &&
+        gguf_find_key(ctx_gguf, "bert.attention.layer_norm_epsilon") < 0)
+        hp.layer_norm_eps = 1e-5f;
 
     // Capture tensor count here so it's globally visible across all subsequent blocks
     const int n_tensors = gguf_get_n_tensors(ctx_gguf);
@@ -903,6 +1017,14 @@ BERT_API struct bert_ctx * bert_load_from_file(const char * fname, bool use_cpu)
             {"position_embd.weight",
              "bert.embeddings.position_embeddings.weight",
              "embeddings.position_embeddings.weight"});
+        const int position_offset = bctx->embedding.roberta_positions ? bctx->embedding.pad_token + 1 : 0;
+        const int64_t position_capacity = model.position_embeddings->ne[1] - position_offset;
+        if (position_capacity <= 0) {
+            ggml_log_internal(GGML_LOG_LEVEL_ERROR, "bert: position table cannot hold the model's position offset\n");
+            gguf_free(ctx_gguf); ggml_free(ctx_ggml); bert_free(bctx);
+            return nullptr;
+        }
+        hp.n_max_tokens = int32_t(std::min<int64_t>(hp.n_max_tokens, position_capacity));
         model.ln_e_w = get_tensor_exhaustive(bctx->ctx_data, ctx_gguf,
             {"token_embd_norm.weight",
              "bert.embeddings.LayerNorm.weight",
@@ -1386,7 +1508,7 @@ struct bert_cached_graph {
     // heap churn on every forward. Only the contents are rewritten per call.
     std::vector<int32_t> scratch_tl;   // token ids
     std::vector<float>   scratch_pm;   // pad mask (1=real, 0=padding)
-    std::vector<float>   scratch_sv;   // mean-pool weights (1/seq_len on real, 0 on pad)
+    std::vector<float>   scratch_sv;   // mean weights or one-hot CLS/last selection
 
     // Constant buffers — filled once at build, re-uploaded each call on CPU
     // (gallocr quirk: input-flagged tensors don't stay stable between computes).
@@ -1595,9 +1717,9 @@ build_cached_graph(bert_ctx * ctx, int max_len, int n_batch) {
         inpL = cur;
     }
 
-    // Mean pooling via 3D mul_mat that preserves the batch dim.
+    // Model-selected pooling via 3D mul_mat that preserves the batch dim.
     //   inpL: [n_embd, max_len, n_batch]
-    //   sum:  [max_len, 1, n_batch]    (1/seq_len on active positions, 0 on padding)
+    //   sum:  [max_len, 1, n_batch]    (mean weights or one-hot CLS/last; zero on padding)
     //
     // For broadcasted batched mul_mat(A, B):
     //   A: [k, n, batch], B: [k, m, batch]  -> [n, m, batch]
@@ -1758,9 +1880,8 @@ void bert_forward_batch(bert_ctx * ctx, bert_batch batch,
     }
     bert_cached_graph & cg = *it->second;
 
-    // Fill per-call input buffers. positions / token_types were
-    // pre-filled at build time and never change. Scratch vectors are sized
-    // once in build_cached_graph; we only rewrite their contents here.
+    // Fill per-call inputs. RoBERTa positions start at padding_idx + 1 and
+    // padding positions retain padding_idx. All scratch vectors are reused.
     {
         int32_t * tl = cg.scratch_tl.data();
         float   * pm = cg.scratch_pm.data();
@@ -1770,15 +1891,21 @@ void bert_forward_batch(bert_ctx * ctx, bert_batch batch,
             const int cl = (int)batch[ba].size();
             const float w = (cl > 0) ? 1.0f / (float)cl : 0.0f;
             const int row = ba * max_len;
+            const auto & config = ctx->embedding;
+            int next_position = config.pad_token + 1;
             for (int i = 0; i < cl; ++i) {
                 tl[row + i] = batch[ba][i];
                 pm[row + i] = 0.0f;       // real token: contributes 0 to attention bias
-                sv[row + i] = w;
+                cg.scratch_pos[row + i] = config.roberta_positions ?
+                    (tl[row + i] == config.pad_token ? config.pad_token : next_position++) : i;
+                sv[row + i] = config.pooling == bert_pooling_type::CLS ? float(i == 0) :
+                              config.pooling == bert_pooling_type::LAST ? float(i == cl - 1) : w;
             }
             for (int i = cl; i < max_len; ++i) {
-                tl[row + i] = 0;
+                tl[row + i] = config.pad_token;
                 pm[row + i] = -100000.0f; // padding: masks out this position
                 sv[row + i] = 0.0f;
+                cg.scratch_pos[row + i] = config.roberta_positions ? config.pad_token : i;
             }
         }
         ggml_backend_tensor_set(cg.token_layer, tl, 0, ggml_nbytes(cg.token_layer));

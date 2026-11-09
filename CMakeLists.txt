@@ -120,5 +120,11 @@ set_target_properties(bert PROPERTIES
     SOVERSION 2
 )
 
+option(BERT_BUILD_TESTS "Build model-input and pooling regression tests" OFF)
+if(BERT_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
+endif()
+
 
 

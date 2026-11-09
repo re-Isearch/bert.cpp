@@ -6,5 +6,8 @@ target_link_libraries(main PRIVATE bert ggml)
 add_executable(bench bench.cpp)
 target_link_libraries(bench PRIVATE bert ggml)
 
+add_executable(embedding_probe embedding_probe.cpp)
+target_link_libraries(embedding_probe PRIVATE bert ggml)
+
 #add_executable(basic basic.cpp)
 #target_link_libraries(basic PRIVATE bert ggml)

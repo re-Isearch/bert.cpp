@@ -66,6 +66,20 @@ struct bert_vocab {
     bool is_sentencepiece = false;
 };
 
+// GGUF pooling values used for sentence embeddings. These are independent of
+// model-weight precision and of the downstream vector-index storage format.
+enum class bert_pooling_type : int32_t { MEAN = 1, CLS = 2, LAST = 3 };
+
+struct bert_embedding_config {
+    bert_token cls_token = 101;
+    bert_token sep_token = 102;
+    bert_token unk_token = 100;
+    bert_token pad_token = 0;
+    bool lowercase = true;
+    bool roberta_positions = false;
+    bert_pooling_type pooling = bert_pooling_type::MEAN;
+};
+
 struct bert_model {
     bert_hparams hparams;
     struct ggml_tensor * word_embeddings;
@@ -102,6 +116,7 @@ struct bert_ctx {
     // at a given (max_len, batch_size); reused for all subsequent forwards at the
     // same shape so we avoid rebuilding the graph and re-running gallocr.
     void * graph_cache = nullptr;
+    bert_embedding_config embedding;
 };
 
 
