@@ -22,6 +22,70 @@ A simple test is:
 
 Why bert.cpp instead of llama.cpp? Size and performance.
 
+## Model inputs and pooling
+
+Sentence embedding conventions come from the model, independently of GGUF
+weight precision or the downstream vector index. The loader reads special-token
+IDs and casing from GGUF metadata, with vocabulary-name fallbacks. It honors
+`<architecture>.pooling_type`, `bert.pooling_type`, or `pooling_type`: 1 means
+mean, 2 CLS, and 3 last-token pooling. Without that metadata, known BGE encoders
+default to CLS; other existing models retain mean pooling, including multilingual
+E5. RoBERTa architecture alone does not determine pooling. Unsupported sentence
+pooling values are rejected, and non-CLS BGE metadata is reported so a mismatched
+export is visible.
+
+XLM-R/M3 uses `<s>`/`</s>` and case-sensitive text, rather than fixed BERT
+101/102 IDs and unconditional lowercasing. Its non-padding position IDs begin
+at `padding_idx + 1`; padding positions retain `padding_idx`. Position capacity
+is bounded by the actual loaded table. The selected token IDs, casing,
+position offset, and pooling type are logged when a model loads.
+
+Changing these conventions changes the embeddings themselves. Re-embed and
+rebuild indexes created with a different input/pooling profile.
+
+### Inspect embeddings before indexing
+
+`embedding_probe` computes exact cosine/dot products on raw float embeddings,
+without Schmate packing, HNSW, or query-energy score calibration. It prints the
+query token IDs/pieces, model profile, vector norms and unknown-token counts.
+With no passage file it uses a small Searle/election/proverb contrast set:
+
+```sh
+./build/bin/embedding_probe ../models/bge-m3-f16.gguf \
+  "what did John Searle think about Derrida" --cpu
+```
+
+An optional `passages.txt` supplies one passage per line. `--pooling cls|mean|last`
+allows a controlled pooling comparison; `--threads N` sets CPU threads.
+Inputs are unprefixed, matching M3's symmetric interface. Prefix-trained models
+need their intended instruction text supplied explicitly.
+
+### Regression tests
+
+```sh
+cmake -S . -B build -DBERT_BUILD_TESTS=ON -DGGML_METAL=OFF \
+  -DGGML_CUDA=OFF -DGGML_VULKAN=OFF -DGGML_BUILD_TESTS=OFF
+cmake --build build --target embedding_profile_test embedding_probe -j2
+ctest --test-dir build --output-on-failure
+```
+
+The test exports small one-layer GGUF fixtures and loads them through the real
+backend. Independent float calculations verify CLS/mean/last pooling, model
+position offsets, unequal-length batches and graph-cache reuse. It also covers
+special IDs, case sensitivity, remapped vocabularies, a WordPiece vocabulary
+containing a literal `▁`, short vocabularies, token budgets and metadata defaults.
+Large model weights are not required. CPU fixtures do not establish full M3
+retrieval quality or Metal/CUDA parity.
+
+The existing greedy SentencePiece segmenter remains an approximation: these
+changes do not implement SentencePiece's full normalization/unigram pipeline.
+Compare probe token IDs with the source tokenizer when validating a GGUF export.
+
+Reference conventions: [M3 model configuration](https://huggingface.co/BAAI/bge-m3/blob/main/config.json),
+[casing configuration](https://huggingface.co/BAAI/bge-m3/blob/main/sentence_bert_config.json),
+[CLS dense embedding guidance](https://huggingface.co/BAAI/bge-m3/discussions/80), and
+[XLM-R position construction](https://github.com/huggingface/transformers/blob/v4.44.2/src/transformers/models/xlm_roberta/modeling_xlm_roberta.py).
+
 On an Apple M1:
 model:   sentence-transformers_all-MiniLM-L12-v2
 main:    token time =     0.03 ms / 0.01 ms per token

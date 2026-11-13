@@ -1,0 +1,3 @@
+add_executable(embedding_profile_test embedding_profile.cpp)
+target_link_libraries(embedding_profile_test PRIVATE bert ggml)
+add_test(NAME embedding_profile COMMAND embedding_profile_test)
